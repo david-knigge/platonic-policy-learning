@@ -5,6 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from rlbench.datasets.imitation_learning.cached_dataset import get_temporal_cached_dataloader
 
@@ -14,12 +15,8 @@ from src.policies import DiTDiffusionPolicy, DiTDiffusionPolicyConfig
 def parse_args() -> argparse.Namespace:
     # Configure the CLI so experiments can adjust hyperparameters without touching code.
     parser = argparse.ArgumentParser(description="Train a minimal DiT diffusion policy.")
-    parser.add_argument(
-        "--cache-paths",
-        nargs="+",
-        required=True,
-        help="One or more RLBench temporal cache files or directories containing them.",
-    )
+    parser.add_argument("--cache-path", type=str, default="/home/dknigge/project_dir/data/robotics/rlbench/imitation_learning/", help="RLBench imitation learning cache root dir.")
+    parser.add_argument("--tasks", type=str, nargs="+", default=None, help="List of RLBench tasks to train on. Uses all if unspecified.")
     parser.add_argument("--output-dir", type=str, default="artifacts", help="Directory to store checkpoints.")
 
     # Training loop hyperparameters that control optimisation.
@@ -31,12 +28,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shuffle", action="store_true", help="Shuffle RLBench samples each epoch.")
     parser.add_argument("--drop-last", action="store_true", help="Drop the final incomplete batch.")
     parser.add_argument("--pin-memory", action="store_true", help="Enable DataLoader pinned-memory optimisation.")
-    parser.add_argument(
-        "--dataloader-kwargs",
-        type=str,
-        default="{}",
-        help="JSON object forwarded directly into RLBench cached dataloader.",
-    )
 
     # Model architecture knobs exposed for quick sweeps.
     parser.add_argument("--hidden-dim", type=int, default=512, help="Transformer hidden size.")
@@ -56,22 +47,28 @@ def parse_args() -> argparse.Namespace:
     # Miscellaneous training conveniences.
     parser.add_argument("--checkpoint-every", type=int, default=5, help="Save checkpoint every N epochs.")
     parser.add_argument("--grad-clip", type=float, default=0.0, help="Gradient clipping threshold (0 disables).")
-    parser.add_argument("--use-cuda", action="store_true", help="Force CUDA usage when available.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     # Decide whether to leverage GPU acceleration; fall back to CPU when unavailable.
-    device = torch.device("cuda" if args.use_cuda and torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Resolve rlbench dataloader from the cache root supplied on the CLI.
-    cache_paths = [Path(p).expanduser().resolve() for p in args.cache_paths]
-    if len(cache_paths) != 1:
-        raise ValueError("Pass a single cache root; use the rlbench 'tasks' argument to select subsets.")
-    cache_root = cache_paths[0]
+    cache_root = Path(args.cache_path).expanduser().resolve()
     if not cache_root.exists():
         raise FileNotFoundError(f"Cache path not found: {cache_root}")
+    
+    # List all dirs under cache root as possible tasks, and list which are selected.
+    available_tasks = [d.name for d in cache_root.iterdir() if d.is_dir()]
+    if args.tasks is None:
+        args.tasks = available_tasks
+    else:
+        for task in args.tasks:
+            if task not in available_tasks:
+                raise ValueError(f"Requested task '{task}' not found in cache at {cache_root}")
+    print(f"Using tasks: {args.tasks} from available: {available_tasks}")
 
     dataloader = get_temporal_cached_dataloader(
         cache_root,
@@ -124,11 +121,33 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    total_params = sum(p.numel() for p in policy.parameters())
+    trainable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    print("Policy architecture:\n")
+    print(policy)
+    print(
+        f"\nParameters | total: {total_params:,} | trainable: {trainable_params:,} | device: {device.type}"
+    )
+
+    try:
+        batches_per_epoch = len(dataloader)
+    except TypeError:
+        batches_per_epoch = None
+
+    print("\nStarting training...")
     for epoch in range(1, args.epochs + 1):
         policy.train()
         running_loss = 0.0
+        batches_processed = 0
 
-        for batch in dataloader:
+        progress = tqdm(
+            dataloader,
+            total=batches_per_epoch,
+            desc=f"Epoch {epoch}/{args.epochs}",
+            leave=False,
+        )
+
+        for batch in progress:
             observations = batch["observation"]["proprio_sequence"].to(device)  # (B, To, obs_dim)
             actions = batch["action"].to(device)  # (B, Ta, action_dim)
             policy_batch = {
@@ -146,11 +165,15 @@ def main() -> None:
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), args.grad_clip)
 
             optimizer.step()
+            batches_processed += 1
             running_loss += loss.item()
+            avg_loss = running_loss / batches_processed
+            progress.set_postfix(loss=f"{avg_loss:.6f}")
 
-        avg_loss = running_loss / max(1, len(dataloader))
+        progress.close()
+        avg_loss = running_loss / max(1, batches_processed)
         # Report scalar loss so training progress is visible without extra tooling.
-        print(f"epoch {epoch:03d} | loss {avg_loss:.6f}")
+        tqdm.write(f"epoch {epoch:03d} | loss {avg_loss:.6f}")
 
         if epoch % args.checkpoint_every == 0 or epoch == args.epochs:
             checkpoint_path = output_dir / f"policy_epoch{epoch:03d}.pt"
