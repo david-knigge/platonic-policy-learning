@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -188,6 +188,67 @@ class DiTDiffusionPolicy(nn.Module):
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         return self.compute_loss(batch)
+
+    def sample_actions(
+        self, observations: torch.Tensor, generator: Optional[torch.Generator] = None
+    ) -> torch.Tensor:
+        # Infer batch sizing so the sampler emits a matching action rollout.
+        batch_size = observations.shape[0]  # ()
+        device = observations.device  # torch.device
+
+        # Prepare a Gaussian starting point for the reverse diffusion trajectory.
+        sample = torch.randn(
+            (batch_size, self.cfg.horizon, self.cfg.action_dim),
+            generator=generator,
+            device=device,
+        )  # (B, Ta, action_dim)
+
+        # Encode observations once since they stay fixed throughout denoising.
+        obs_tokens = self._encode_observations(observations)  # (B, To, D)
+
+        # Configure the scheduler timesteps for inference.
+        self.scheduler.set_timesteps(self.num_inference_steps, device=device)  # (num_steps,)
+
+        # Replay the reverse diffusion process until we reach the clean action manifold.
+        for timestep in self.scheduler.timesteps:  # (num_steps,)
+            # Broadcast the scalar timestep across the batch for conditioning.
+            timesteps = torch.full(
+                (batch_size,),
+                timestep,
+                device=device,
+                dtype=torch.long,
+            )  # (B,)
+
+            # Encode the current noisy action tokens under the DiT backbone space.
+            action_tokens = self._encode_actions(sample)  # (B, Ta, D)
+
+            # Concatenate observation and action tokens for joint attention.
+            tokens = torch.cat([obs_tokens, action_tokens], dim=1)  # (B, To+Ta, D)
+
+            # Generate the adaptive LayerNorm modulation from the diffusion timestep.
+            diffusion_cond = self._diffusion_condition(timesteps)  # (B, D)
+
+            # Run the DiT transformer to predict the score (noise) at this timestep.
+            encoded = self.transformer(
+                tokens,
+                diffusion_time_cond=diffusion_cond,
+            )  # (B, To+Ta, D)
+
+            # Project the action slice back into the action space to recover noise estimates.
+            noise_pred = self.output_head(encoded[:, -self.cfg.horizon :, :])  # (B, Ta, action_dim)
+
+            # Apply the scheduler update to obtain the next, slightly cleaner action sample.
+            scheduler_output = self.scheduler.step(
+                noise_pred,
+                timestep,
+                sample,
+                generator=generator,
+            )  # prev_sample: (B, Ta, action_dim)
+
+            sample = scheduler_output.prev_sample  # (B, Ta, action_dim)
+
+        # Return the denoised actions matching the dataset's action tensor layout.
+        return sample  # (B, Ta, action_dim)
 
 
 __all__ = ["DiTDiffusionPolicy", "DiTDiffusionPolicyConfig"]

@@ -6,10 +6,16 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+import wandb
 
 from rlbench.datasets.imitation_learning.cached_dataset import get_temporal_cached_dataloader
 
 from src.policies import DiTDiffusionPolicy, DiTDiffusionPolicyConfig
+from src.utils import (
+    point_cloud_with_actions,
+    NormalizationStats,
+    NormalizationTransform,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,12 +29,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Mini-batch size.")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay for AdamW.")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for AdamW.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader worker processes.")
     parser.add_argument("--shuffle", action="store_true", help="Shuffle RLBench samples each epoch.")
     parser.add_argument("--drop-last", action="store_true", help="Drop the final incomplete batch.")
     parser.add_argument("--pin-memory", action="store_true", help="Enable DataLoader pinned-memory optimisation.")
-
+    parser.add_argument("--normalization-stats", type=str, default='artifacts/stats/normalization_stats.json', help="Path to dataset normalization stats JSON.")
+    
     # Model architecture knobs exposed for quick sweeps.
     parser.add_argument("--hidden-dim", type=int, default=512, help="Transformer hidden size.")
     parser.add_argument("--num-layers", type=int, default=8, help="Transformer depth.")
@@ -47,7 +54,45 @@ def parse_args() -> argparse.Namespace:
     # Miscellaneous training conveniences.
     parser.add_argument("--checkpoint-every", type=int, default=5, help="Save checkpoint every N epochs.")
     parser.add_argument("--grad-clip", type=float, default=0.0, help="Gradient clipping threshold (0 disables).")
+    parser.add_argument("--validate-every", type=int, default=1, help="Run denoising validation every N epochs (0 disables).")
+    parser.add_argument("--wandb-project", type=str, default='ppl', help="Weights & Biases project for logging.")
+    parser.add_argument("--wandb-entity", type=str, default='davidmknigge', help="Weights & Biases entity (optional).")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="Custom name for the Weights & Biases run.")
     return parser.parse_args()
+
+
+def run_validation(
+    policy,
+    dataloader,
+    device,
+    run,
+    epoch: int,
+    normalizer: NormalizationTransform | None,
+) -> None:
+    if run is None:
+        return
+    policy.eval()
+    with torch.no_grad():
+        raw_batch = next(iter(dataloader))
+        batch = normalizer.normalize_batch(raw_batch) if normalizer else raw_batch
+        observations = batch["observation"]["proprio_sequence"].to(device)
+        gt_actions = batch["action"].to(device)
+        pred_actions = policy.sample_actions(observations)
+    if normalizer:
+        cloud_normalized = batch["observation"]["point_cloud_sequence"]
+        cloud_source = normalizer.denormalize_point_cloud_sequence(cloud_normalized)[0]
+        gt_vis = normalizer.denormalize_action_positions(gt_actions.detach().cpu())[0]
+        pred_vis = normalizer.denormalize_action_positions(pred_actions.detach().cpu())[0]
+    else:
+        cloud_source = raw_batch["observation"]["point_cloud_sequence"][0]
+        gt_vis = gt_actions.cpu()[0]
+        pred_vis = pred_actions.cpu()[0]
+    cloud = point_cloud_with_actions(
+        cloud_source,
+        pred_vis,
+        gt_vis,
+    )
+    run.log({"validation/point_cloud": cloud, "validation/epoch": epoch})
 
 
 def main() -> None:
@@ -121,6 +166,23 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load normalization stats and prepare normalizer if a path is provided.
+    if not Path(args.normalization_stats).exists():
+        raise FileNotFoundError(f"Normalization stats file not found: {args.normalization_stats}, run compute_stats.py first.")
+    stats = NormalizationStats.from_json(args.normalization_stats)
+    normalizer = NormalizationTransform(stats)
+
+    # Create a wandb run to log training metrics and model config.
+    wandb_run = None
+    if args.wandb_project:
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            config={**asdict(policy_cfg), **vars(args)},
+        )
+
+    # Print architecture, number of parameters, and training device.
     total_params = sum(p.numel() for p in policy.parameters())
     trainable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print("Policy architecture:\n")
@@ -148,6 +210,8 @@ def main() -> None:
         )
 
         for batch in progress:
+            if normalizer is not None:
+                batch = normalizer.normalize_batch(batch)
             observations = batch["observation"]["proprio_sequence"].to(device)  # (B, To, obs_dim)
             actions = batch["action"].to(device)  # (B, Ta, action_dim)
             policy_batch = {
@@ -169,14 +233,24 @@ def main() -> None:
             running_loss += loss.item()
             avg_loss = running_loss / batches_processed
             progress.set_postfix(loss=f"{avg_loss:.6f}")
+            
+            # Log batch loss for more granular training curves.
+            wandb_run and wandb_run.log({"train/batch_loss": loss.item()})
 
         progress.close()
         avg_loss = running_loss / max(1, batches_processed)
         # Report scalar loss so training progress is visible without extra tooling.
         tqdm.write(f"epoch {epoch:03d} | loss {avg_loss:.6f}")
+        if wandb_run is not None:
+            wandb_run.log({"train/epoch_loss": avg_loss, "epoch": epoch})
+
+        if args.validate_every > 0 and epoch % args.validate_every == 0:
+            run_validation(policy, dataloader, device, wandb_run, epoch, normalizer)
 
         if epoch % args.checkpoint_every == 0 or epoch == args.epochs:
-            checkpoint_path = output_dir / f"policy_epoch{epoch:03d}.pt"
+            checkpoint_dir = output_dir / "checkpoints"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_path = output_dir / f"checkpoints/policy_epoch{epoch:03d}.pt"
             # Persist model weights, optimiser state, and config for reproducibility.
             torch.save(
                 {
@@ -188,6 +262,9 @@ def main() -> None:
                 checkpoint_path,
             )
             print(f"saved checkpoint to {checkpoint_path}")
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

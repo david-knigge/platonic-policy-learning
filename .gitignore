@@ -119,6 +119,8 @@ dmypy.json
 index.html
 output_data/
 .vscode/
+wandb
+artifacts
 
 # # Added these two lines to ignore agents documentation
 .agents_docs
