@@ -10,7 +10,13 @@ import wandb
 
 from rlbench.datasets.imitation_learning.cached_dataset import get_temporal_cached_dataloader
 
-from src.policies import DiTDiffusionPolicy, DiTDiffusionPolicyConfig
+from src.policies import (
+    DiTDiffusionPolicy,
+    DiTDiffusionPolicyConfig,
+    PlatonicDiffusionPolicy,
+    PlatonicDiffusionPolicyConfig,
+)
+from src.models.platonic_transformer.groups import PLATONIC_GROUPS
 from src.utils import (
     point_cloud_with_actions,
     NormalizationStats,
@@ -24,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-path", type=str, default="/home/dknigge/project_dir/data/robotics/rlbench/imitation_learning/", help="RLBench imitation learning cache root dir.")
     parser.add_argument("--tasks", type=str, nargs="+", default=None, help="List of RLBench tasks to train on. Uses all if unspecified.")
     parser.add_argument("--output-dir", type=str, default="artifacts", help="Directory to store checkpoints.")
+    parser.add_argument("--policy", type=str, default="dit", choices=["dit", "platonic"], help="Selects which policy backbone to train.")
 
     # Training loop hyperparameters that control optimisation.
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
@@ -50,6 +57,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta-end", type=float, default=0.02, help="Noise schedule beta end.")
     parser.add_argument("--beta-schedule", type=str, default="scaled_linear", help="Noise schedule type.")
     parser.add_argument("--num-inference-steps", type=int, default=50, help="Sampling steps (for future use).")
+
+    # Platonic transformer specific knobs.
+    parser.add_argument("--platonic-solid", type=str, default="icosahedron", help="Platonic group governing rotational equivariance.")
+    parser.add_argument("--platonic-hidden-dim", type=int, default=480, help="Hidden size for the platonic transformer (must be divisible by group order).")
+    parser.add_argument("--platonic-num-layers", type=int, default=8, help="Number of transformer blocks in the platonic backbone.")
+    parser.add_argument("--platonic-num-heads", type=int, default=60, help="Attention heads for the platonic transformer (must be divisible by group order).")
+    parser.add_argument("--platonic-ffn-dim-factor", type=int, default=4, help="Expansion factor for platonic transformer feed-forward layers.")
+    parser.add_argument("--platonic-dropout", type=float, default=0.0, help="Dropout probability inside the platonic transformer.")
+    parser.add_argument("--platonic-drop-path", type=float, default=0.0, help="Stochastic depth rate for the platonic transformer.")
+    parser.add_argument("--platonic-mean-aggregation", action="store_true", help="Average tokens instead of sum inside attention kernels.")
+    parser.add_argument("--platonic-softmax-attention", action="store_true", help="Enable softmax attention instead of linear kernel attention.")
+    parser.add_argument("--platonic-rope-sigma", type=float, default=1.0, help="Frequency scale for platonic rotary embeddings.")
+    parser.add_argument("--platonic-fixed-freqs", action="store_true", help="Freeze platonic rotary frequencies instead of learning them.")
 
     # Miscellaneous training conveniences.
     parser.add_argument("--checkpoint-every", type=int, default=5, help="Save checkpoint every N epochs.")
@@ -142,22 +162,52 @@ def main() -> None:
         "prediction_type": "epsilon",
     }
 
-    # Construct the DiT-backed policy using inferred shapes plus CLI overrides.
-    policy_cfg = DiTDiffusionPolicyConfig(
-        context_length=context_length,
-        horizon=horizon,
-        obs_dim=obs_dim,
-        action_dim=action_dim,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        mlp_dim=args.mlp_dim,
-        dropout=args.dropout,
-        attention_dropout=args.attention_dropout,
-        noise_scheduler_kwargs=scheduler_kwargs,
-        num_inference_steps=args.num_inference_steps,
-    )
-    policy = DiTDiffusionPolicy(policy_cfg).to(device)
+    if args.policy == "dit":
+        # Construct the DiT-backed policy using inferred shapes plus CLI overrides.
+        policy_cfg = DiTDiffusionPolicyConfig(
+            context_length=context_length,
+            horizon=horizon,
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+            mlp_dim=args.mlp_dim,
+            dropout=args.dropout,
+            attention_dropout=args.attention_dropout,
+            noise_scheduler_kwargs=scheduler_kwargs,
+            num_inference_steps=args.num_inference_steps,
+        )
+        policy = DiTDiffusionPolicy(policy_cfg).to(device)
+    else:
+        solid = args.platonic_solid.lower()
+        if solid not in PLATONIC_GROUPS:
+            raise ValueError(f"Unknown platonic solid '{solid}'. Available groups: {list(PLATONIC_GROUPS.keys())}")
+        group = PLATONIC_GROUPS[solid]
+        if args.platonic_hidden_dim % group.G != 0:
+            raise ValueError(f"Platonic hidden_dim ({args.platonic_hidden_dim}) must be divisible by group order ({group.G}).")
+        if args.platonic_num_heads % group.G != 0:
+            raise ValueError(f"Platonic num_heads ({args.platonic_num_heads}) must be divisible by group order ({group.G}).")
+
+        # Platonic policy acts on pose tensors: obs/actions are 8D (pos + quat + gripper).
+        policy_cfg = PlatonicDiffusionPolicyConfig(
+            context_length=context_length,
+            horizon=horizon,
+            hidden_dim=args.platonic_hidden_dim,
+            num_layers=args.platonic_num_layers,
+            num_heads=args.platonic_num_heads,
+            solid_name=solid,
+            ffn_dim_factor=args.platonic_ffn_dim_factor,
+            dropout=args.platonic_dropout,
+            drop_path_rate=args.platonic_drop_path,
+            mean_aggregation=args.platonic_mean_aggregation,
+            use_softmax_attention=args.platonic_softmax_attention,
+            rope_sigma=args.platonic_rope_sigma,
+            learned_freqs=not args.platonic_fixed_freqs,
+            noise_scheduler_kwargs=scheduler_kwargs,
+            num_inference_steps=args.num_inference_steps,
+        )
+        policy = PlatonicDiffusionPolicy(policy_cfg).to(device)
 
     # AdamW optimiser keeps weight decay decoupled from gradient magnitude.
     optimizer = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
