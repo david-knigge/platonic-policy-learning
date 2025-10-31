@@ -24,6 +24,15 @@ def _rotate_vectors(vectors: torch.Tensor, rotation: torch.Tensor) -> torch.Tens
     return torch.einsum("ij,...kj->...ki", rotation, vectors)
 
 
+def _translate_vectors(vectors: torch.Tensor, translation: torch.Tensor) -> torch.Tensor:
+    """Translate the position channel (index 0) of vector features."""
+    translated = vectors.clone()
+    translated[..., 0, :] = translated[..., 0, :] + translation.to(
+        dtype=vectors.dtype, device=vectors.device
+    )
+    return translated
+
+
 def _rotate_pose_sequence(pose: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
     """Rotate pose tensors by first converting to the scalar/vector format."""
     scalars, vectors = _pose_to_features(pose)
@@ -31,11 +40,39 @@ def _rotate_pose_sequence(pose: torch.Tensor, rotation: torch.Tensor) -> torch.T
     return _features_to_pose(scalars, rotated_vectors)
 
 
+def _translate_pose_sequence(pose: torch.Tensor, translation: torch.Tensor) -> torch.Tensor:
+    """Translate pose tensors by shifting position channels."""
+    scalars, vectors = _pose_to_features(pose)
+    translated_vectors = _translate_vectors(vectors, translation)
+    return _features_to_pose(scalars, translated_vectors)
+
+
+def _rototranslate_pose_sequence(
+    pose: torch.Tensor, rotation: torch.Tensor, translation: torch.Tensor
+) -> torch.Tensor:
+    """Apply rotation followed by translation to pose tensors."""
+    return _translate_pose_sequence(_rotate_pose_sequence(pose, rotation), translation)
+
+
 def _rotate_packed(tensor: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
     """Rotate packed (flattened) action tensors used by the diffusion scheduler."""
     scalars, vectors = _unpack_features(tensor, vector_channels=3, scalar_channels=1)
     rotated_vectors = _rotate_vectors(vectors, rotation)
     return _pack_features(scalars, rotated_vectors)
+
+
+def _translate_packed(tensor: torch.Tensor, translation: torch.Tensor) -> torch.Tensor:
+    """Translate the position channel within packed action tensors."""
+    scalars, vectors = _unpack_features(tensor, vector_channels=3, scalar_channels=1)
+    translated_vectors = _translate_vectors(vectors, translation)
+    return _pack_features(scalars, translated_vectors)
+
+
+def _rototranslate_packed(
+    tensor: torch.Tensor, rotation: torch.Tensor, translation: torch.Tensor
+) -> torch.Tensor:
+    """Apply rotation followed by translation within packed action tensors."""
+    return _translate_packed(_rotate_packed(tensor, rotation), translation)
 
 
 def _fetch_batch():
@@ -282,4 +319,76 @@ def test_sampling_equivariance_deterministic():
 
     rot_m = quaternion_to_matrix(actions_rot[..., 3:7])
     ref_m = quaternion_to_matrix(rotated_actions[..., 3:7])
+    assert torch.allclose(rot_m, ref_m, atol=5e-4)
+
+
+def test_sampling_equivariance_rototranslation():
+    observations, _ = _fetch_batch()
+    group = PLATONIC_GROUPS["icosahedron"]
+
+    cfg = PlatonicDiffusionPolicyConfig(
+        context_length=observations.shape[1],
+        horizon=4,
+        hidden_dim=group.G * 2,
+        num_layers=1,
+        num_heads=group.G,
+        solid_name="icosahedron",
+        ffn_dim_factor=2,
+        noise_scheduler_kwargs={
+            "num_train_timesteps": 100,
+            "beta_start": 0.0001,
+            "beta_end": 0.02,
+            "beta_schedule": "scaled_linear",
+            "prediction_type": "epsilon",
+        },
+        num_inference_steps=10,
+    )
+    policy = PlatonicDiffusionPolicy(cfg).cpu()
+    policy.eval()
+
+    noise = torch.randn(
+        (
+            observations.shape[0],
+            cfg.horizon,
+            cfg.vector_channels * 3 + cfg.scalar_channels,
+        )
+    )
+    scalars, vectors = policy.sample_actions(
+        observations,
+        initial_noise=noise,
+        deterministic=True,
+        return_features=True,
+    )
+    actions = _features_to_pose(scalars, vectors).cpu()
+
+    rotation = group.elements[9].to(dtype=observations.dtype)
+    translation = torch.tensor([0.15, -0.08, 0.05], dtype=observations.dtype)
+
+    observations_rt = _rototranslate_pose_sequence(observations, rotation, translation)
+
+    noise_rt = _rototranslate_packed(noise, rotation, translation)
+    scalars_rt, vectors_rt = policy.sample_actions(
+        observations_rt,
+        initial_noise=noise_rt,
+        deterministic=True,
+        return_features=True,
+    )
+    actions_rt = _features_to_pose(scalars_rt, vectors_rt).cpu()
+
+    reference = _rototranslate_pose_sequence(actions, rotation, translation)
+
+    def canonicalise(pose: torch.Tensor) -> torch.Tensor:
+        quat = pose[..., 3:7]
+        sign = torch.where(quat[..., -1:] < 0, -1.0, 1.0)
+        pose = pose.clone()
+        pose[..., 3:7] = quat * sign
+        return pose
+
+    actions_rt = canonicalise(actions_rt)
+    reference = canonicalise(reference)
+
+    assert torch.allclose(actions_rt[..., :3], reference[..., :3], atol=5e-4)
+    assert torch.allclose(actions_rt[..., 7:], reference[..., 7:], atol=5e-4)
+    rot_m = quaternion_to_matrix(actions_rt[..., 3:7])
+    ref_m = quaternion_to_matrix(reference[..., 3:7])
     assert torch.allclose(rot_m, ref_m, atol=5e-4)

@@ -19,7 +19,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 
 import numpy as np
 import torch
@@ -30,6 +30,8 @@ from rlbench.datasets.imitation_learning.cached_dataset import (
 
 from src.models.platonic_transformer.groups import PLATONIC_GROUPS
 from src.policies import PlatonicDiffusionPolicy, PlatonicDiffusionPolicyConfig
+from src.policies.platonic_policy import _pack_features, _unpack_features
+from src.utils import NormalizationStats, NormalizationTransform
 from src.utils.geometry import (
     apply_rotation,
     matrix_to_quaternion,
@@ -118,7 +120,7 @@ def fetch_single_sample(
         cache_path,
         tasks=tasks,
         batch_size=1,
-        shuffle=False,
+        shuffle=True,
         num_workers=0,
         pin_memory=False,
         drop_last=False,
@@ -195,7 +197,27 @@ class EquivarianceViewer:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.cache_root = Path(args.cache_path).expanduser().resolve()
-        self.group = PLATONIC_GROUPS[args.platonic_solid.lower()]
+        self.checkpoint_path: Path | None = None
+        self.checkpoint_state: dict[str, torch.Tensor] | None = None
+        self.checkpoint_config: dict[str, Any] | None = None
+        self.horizon = args.horizon
+        self.normalizer = self._load_normalizer(args.normalization_stats)
+
+        if args.checkpoint is not None:
+            self._prepare_checkpoint(args.checkpoint)
+
+        solid_name = (
+            self.checkpoint_config.get("solid_name", args.platonic_solid)
+            if self.checkpoint_config is not None
+            else args.platonic_solid
+        ).lower()
+        if solid_name not in PLATONIC_GROUPS:
+            raise ValueError(
+                f"Unknown platonic solid '{solid_name}'. "
+                f"Available groups: {list(PLATONIC_GROUPS.keys())}"
+            )
+        self.group = PLATONIC_GROUPS[solid_name]
+        self.solid_name = solid_name
         self.sample: Optional[SampleBatch] = fetch_single_sample(
             self.cache_root,
             args.tasks,
@@ -208,6 +230,8 @@ class EquivarianceViewer:
             print("[viewer] Initialising Platonic policy.")
             self.policy = self._build_policy(self.sample)
             self.policy.eval()
+            if self.checkpoint_state is not None:
+                self._load_checkpoint_weights()
             print("[viewer] Policy initialised.")
             self.generator = torch.Generator(device=self.policy.device).manual_seed(0)
         else:
@@ -237,10 +261,95 @@ class EquivarianceViewer:
 
     # ------------------------------------------------------------------ GUI / policy setup
 
+    def _load_normalizer(self, stats_path: str | None) -> NormalizationTransform | None:
+        """Load dataset normalization stats for consistent policy inputs."""
+        if stats_path is None:
+            return None
+        path = Path(stats_path).expanduser().resolve()
+        if not path.exists():
+            print(f"[viewer] Normalization stats not found at {path}; proceeding without normalization.")
+            return None
+        try:
+            stats = NormalizationStats.from_json(path)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            print(f"[viewer] Failed to load normalization stats '{path}': {exc}")
+            return None
+        print(f"[viewer] Loaded normalization stats from {path}")
+        return NormalizationTransform(stats)
+
+    def _prepare_checkpoint(self, checkpoint: str) -> None:
+        """Load checkpoint metadata so we can restore weights after building the policy."""
+        path = Path(checkpoint).expanduser().resolve()
+        self.checkpoint_path = path
+        if not path.exists():
+            print(f"[viewer] Checkpoint not found: {path}")
+            return
+        try:
+            blob = torch.load(path, map_location="cpu")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            print(f"[viewer] Failed to load checkpoint '{path}': {exc}")
+            return
+
+        self.checkpoint_state = None
+
+        if isinstance(blob, dict):
+            if "model_state" in blob:
+                self.checkpoint_state = blob["model_state"]
+            elif all(isinstance(v, torch.Tensor) for v in blob.values()):
+                # Pure state dict case.
+                self.checkpoint_state = blob  # type: ignore[assignment]
+            config = blob.get("config")
+            if isinstance(config, dict):
+                self.checkpoint_config = config
+                horizon_override = config.get("horizon")
+                if horizon_override is not None and int(horizon_override) != self.horizon:
+                    print(
+                        f"[viewer] Overriding horizon to {int(horizon_override)} "
+                        "from checkpoint config."
+                    )
+                    self.horizon = int(horizon_override)
+        if self.checkpoint_state is None:
+            print(
+                "[viewer] Checkpoint loaded, but no model_state found. "
+                "Continuing with randomly initialised weights."
+            )
+
+    def _load_checkpoint_weights(self) -> None:
+        """Restore model weights from the loaded checkpoint blob."""
+        if self.policy is None or self.checkpoint_state is None:
+            return
+        try:
+            load_status = self.policy.load_state_dict(self.checkpoint_state, strict=False)
+        except RuntimeError as exc:
+            print(f"[viewer] Failed to load checkpoint weights: {exc}")
+            return
+        missing, unexpected = load_status
+        if missing:
+            print(f"[viewer] Missing keys while loading checkpoint: {sorted(missing)}")
+        if unexpected:
+            print(f"[viewer] Unexpected keys while loading checkpoint: {sorted(unexpected)}")
+        if self.checkpoint_path is not None:
+            print(f"[viewer] Loaded checkpoint weights from {self.checkpoint_path}")
+
     def _build_policy(self, sample: SampleBatch) -> PlatonicDiffusionPolicy:
         """Initialise a Platonic policy whose tensor shapes match the sample."""
         context_length = int(sample.proprio.shape[0])
-        horizon = int(sample.actions.shape[0])
+        if self.checkpoint_config is not None:
+            cfg_dict = dict(self.checkpoint_config)
+            cfg = PlatonicDiffusionPolicyConfig(**cfg_dict)
+            if cfg.horizon <= 0:
+                raise ValueError("Checkpoint horizon must be positive.")
+            if cfg.context_length != context_length:
+                print(
+                    f"[viewer] Warning: checkpoint context_length={cfg.context_length} "
+                    f"differs from sample context_length={context_length}."
+                )
+            self.horizon = cfg.horizon
+            return PlatonicDiffusionPolicy(cfg)
+
+        horizon = int(self.horizon)
+        if horizon <= 0:
+            raise ValueError("horizon must be a positive integer.")
 
         if self.args.platonic_hidden_dim % self.group.G != 0:
             raise ValueError(
@@ -257,7 +366,7 @@ class EquivarianceViewer:
             hidden_dim=self.args.platonic_hidden_dim,
             num_layers=self.args.platonic_num_layers,
             num_heads=self.args.platonic_num_heads,
-            solid_name=self.args.platonic_solid.lower(),
+            solid_name=self.solid_name,
             ffn_dim_factor=self.args.platonic_ffn_dim_factor,
             dropout=self.args.platonic_dropout,
             drop_path_rate=self.args.platonic_drop_path,
@@ -313,6 +422,8 @@ class EquivarianceViewer:
         """Sample a trajectory from the Platonic policy given an observation sequence."""
         if self.policy is None:
             raise RuntimeError("Policy is not initialised.")
+        if self.normalizer is not None:
+            proprio = self.normalizer.normalize_proprio(proprio)
         with torch.no_grad():
             # Policy expects shape (B, T_obs, obs_dim); we only use batch size 1.
             batch = proprio.unsqueeze(0).to(self.policy.device)
@@ -344,6 +455,8 @@ class EquivarianceViewer:
         points_np, colors_np = point_cloud_to_numpy(last_views)
 
         gt_actions = sample.actions.cpu().numpy()  # (T_action, 8)
+        if self.policy.cfg.horizon < gt_actions.shape[0]:
+            gt_actions = gt_actions[: self.policy.cfg.horizon]
         if initialise_noise or getattr(self, "initial_noise", None) is None:
             self.initial_noise = torch.randn(
                 (
@@ -358,6 +471,10 @@ class EquivarianceViewer:
             sample.proprio,
             noise=self.initial_noise.clone() if self.initial_noise is not None else None,
         )
+        if self.normalizer is not None:
+            pred_actions_tensor = torch.from_numpy(pred_actions).to(dtype=torch.float32)
+            pred_actions_tensor = self.normalizer.denormalize_action_positions(pred_actions_tensor)
+            pred_actions = pred_actions_tensor.cpu().numpy()
 
         self._update_point_cloud(points_np, colors_np)
         self._update_trajectories(gt_actions, pred_actions)
@@ -381,8 +498,8 @@ class EquivarianceViewer:
 
     def _update_trajectories(self, gt_actions: np.ndarray, pred_actions: np.ndarray) -> None:
         """Draw both ground-truth and predicted trajectories with frames."""
-        gt_positions = gt_actions[:, :3]  # (T, 3)
-        pred_positions = pred_actions[:, :3]  # (T, 3)
+        gt_positions = gt_actions[:, :3].astype(np.float32)  # (T, 3)
+        pred_positions = pred_actions[:, :3].astype(np.float32)  # (T, 3)
 
         gt_segments = trajectory_segments(gt_positions)
         pred_segments = trajectory_segments(pred_positions)
@@ -499,6 +616,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", type=str, nargs="+", default=None, help="Optional task subset to sample from.")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address for the viser server.")
     parser.add_argument("--port", type=int, default=8080, help="Port for the viser server.")
+    parser.add_argument("--horizon", type=int, default=1, help="Override the policy action horizon.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Optional policy checkpoint to restore before sampling.")
+    parser.add_argument("--normalization-stats", type=str, default="artifacts/stats/normalization_stats.json", help="Path to dataset normalization stats JSON.")
     parser.add_argument("--platonic-solid", type=str, default="icosahedron", help="Platonic group used for rotations.")
     parser.add_argument("--platonic-hidden-dim", type=int, default=480, help="Transformer hidden width (must divide group order).")
     parser.add_argument("--platonic-num-heads", type=int, default=60, help="Number of attention heads (must divide group order).")
