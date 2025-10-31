@@ -95,16 +95,33 @@ def run_validation(
     with torch.no_grad():
         raw_batch = next(iter(dataloader))
         batch = normalizer.normalize_batch(raw_batch) if normalizer else raw_batch
-        observations = batch["observation"]["proprio_sequence"].to(device)
+        observation = batch["observation"]["point_cloud_sequence"]
+        proprio = batch["observation"]["proprio_sequence"].to(device)
+        pc_points = observation["points"].to(device)
+        pc_colors = observation["colors"].to(device)
         gt_actions = batch["action"].to(device)
-        pred_actions = policy.sample_actions(observations)
+        observation_tokens = {
+            "positions": pc_points,
+            "colors": pc_colors,
+        }
+        pred_actions = policy.sample_actions(proprio, observation_tokens)
     if normalizer:
         cloud_normalized = batch["observation"]["point_cloud_sequence"]
-        cloud_source = normalizer.denormalize_point_cloud_sequence(cloud_normalized)[0]
+        cloud_denorm = normalizer.denormalize_point_cloud_sequence(cloud_normalized)
+        cloud_source = {}
+        for key, value in cloud_denorm.items():
+            if value is None:
+                continue
+            cloud_source[key] = value[0].detach().cpu()
         gt_vis = normalizer.denormalize_action_positions(gt_actions.detach().cpu())[0]
         pred_vis = normalizer.denormalize_action_positions(pred_actions.detach().cpu())[0]
     else:
-        cloud_source = raw_batch["observation"]["point_cloud_sequence"][0]
+        raw_cloud = raw_batch["observation"]["point_cloud_sequence"]
+        cloud_source = {}
+        for key, value in raw_cloud.items():
+            if value is None:
+                continue
+            cloud_source[key] = value[0].detach().cpu()
         gt_vis = gt_actions.cpu()[0]
         pred_vis = pred_actions.cpu()[0]
     cloud = point_cloud_with_actions(
@@ -153,6 +170,8 @@ def main() -> None:
     horizon = int(actions.shape[1])
     obs_dim = int(observations.shape[2])
     action_dim = int(actions.shape[2])
+    pc_dict = sample["observation"]["point_cloud_sequence"]
+    point_feature_dim = pc_dict["points"].shape[-1] + pc_dict["colors"].shape[-1]
 
     scheduler_kwargs = {
         "num_train_timesteps": args.num_train_timesteps,
@@ -167,7 +186,7 @@ def main() -> None:
         policy_cfg = DiTDiffusionPolicyConfig(
             context_length=context_length,
             horizon=horizon,
-            obs_dim=obs_dim,
+            proprio_dim=obs_dim,
             action_dim=action_dim,
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
@@ -177,6 +196,7 @@ def main() -> None:
             attention_dropout=args.attention_dropout,
             noise_scheduler_kwargs=scheduler_kwargs,
             num_inference_steps=args.num_inference_steps,
+            point_feature_dim=point_feature_dim,
         )
         policy = DiTDiffusionPolicy(policy_cfg).to(device)
     else:
@@ -262,10 +282,17 @@ def main() -> None:
         for batch in progress:
             if normalizer is not None:
                 batch = normalizer.normalize_batch(batch)
-            observations = batch["observation"]["proprio_sequence"].to(device)  # (B, To, obs_dim)
+            proprio = batch["observation"]["proprio_sequence"].to(device)  # (B, To, obs_dim)
+            pc_dict = batch["observation"]["point_cloud_sequence"]
+            pc_points = pc_dict["points"].to(device)
+            pc_colors = pc_dict["colors"].to(device)
             actions = batch["action"].to(device)  # (B, Ta, action_dim)
             policy_batch = {
-                "observations": observations,  # (B, To, obs_dim)
+                "proprio": proprio,  # (B, To, obs_dim)
+                "observation": {
+                    "positions": pc_points,  # (B, To, N, 3)
+                    "colors": pc_colors,  # (B, To, N, 3)
+                },
                 "actions": actions,  # (B, Ta, action_dim)
             }
 

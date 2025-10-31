@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
+import math
 
 import torch
 import torch.nn as nn
@@ -39,8 +40,10 @@ class DiTDiffusionPolicyConfig:
     context_length: int
     # Length of the action rollout the policy predicts per sample.
     horizon: int
-    # Dimensionality of each observation vector.
-    obs_dim: int
+    # Number of features provided per point (position + colour).
+    point_feature_dim: int
+    # Dimensionality of each proprioceptive vector.
+    proprio_dim: int
     # Dimensionality of each action vector.
     action_dim: int
     # Hidden size shared across transformer, embeddings, and output head.
@@ -93,7 +96,16 @@ class DiTDiffusionPolicy(nn.Module):
         self.transformer = DiffusionTransformer(transformer_cfg)
 
         # Linear projections turn observations and actions into token embeddings.
-        self.obs_encoder = nn.Linear(cfg.obs_dim, cfg.hidden_dim)
+        if cfg.proprio_dim <= 0:
+            raise ValueError("proprio_dim must be positive.")
+        self.proprio_encoder = nn.Linear(cfg.proprio_dim, cfg.hidden_dim)
+        if cfg.point_feature_dim <= 0:
+            raise ValueError("point_feature_dim must be positive.")
+        self.point_feature_proj = nn.Sequential(
+            nn.Linear(cfg.point_feature_dim, cfg.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+        )
         self.action_encoder = nn.Linear(cfg.action_dim, cfg.hidden_dim)
         self.output_head = nn.Sequential(
             nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
@@ -112,51 +124,87 @@ class DiTDiffusionPolicy(nn.Module):
             nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
         )
 
-        # Learned embeddings differentiate between observation and action token types.
-        node_types = torch.randn(2, cfg.hidden_dim) * 0.02  # (2, D)
-        self.node_type_embeddings = nn.Parameter(node_types)
-
         # Instantiate a DDPM scheduler with user-provided hyperparameters.
         scheduler_kwargs = dict(cfg.noise_scheduler_kwargs or {})
         self.scheduler = DDPMScheduler(**scheduler_kwargs)
         self.num_inference_steps = cfg.num_inference_steps
 
         # Pre-compute absolute time indices for observations and actions.
-        context_idx = torch.arange(cfg.context_length, dtype=torch.float32).unsqueeze(0)  # (1, To)
+        context_idx = torch.arange(cfg.context_length, dtype=torch.float32).unsqueeze(0)  # (1, N_time)
         self.register_buffer("context_time_indices", context_idx, persistent=False)
-        action_idx = torch.arange(cfg.horizon, dtype=torch.float32).unsqueeze(0)  # (1, Ta)
+        action_idx = torch.arange(cfg.horizon, dtype=torch.float32).unsqueeze(0)  # (1, N_action)
         self.register_buffer("action_time_indices", action_idx, persistent=False)
 
     # ------------------------------------------------------------------
-    def _encode_observations(self, observations: torch.Tensor) -> torch.Tensor:
-        # Map each observation vector into the common hidden space.
-        tokens = self.obs_encoder(observations)  # (B, To, D)
-        batch = tokens.shape[0]
-        times = self.context_time_indices.expand(batch, -1)  # (B, To)
-        time_emb = self.world_time_embedder(times)  # (B, To, D)
-        tokens = tokens + time_emb  # (B, To, D)
-        tokens = tokens + self.node_type_embeddings[0].view(1, 1, -1)  # (B, To, D)
+    def _context_time_embedding(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Absolute time indices for the context window."""
+        times = self.context_time_indices.to(device=device, dtype=torch.float32)  # (1, N_time)
+        times = times.expand(batch_size, -1)  # (B, N_time)
+        return self.world_time_embedder(times)  # (B, N_time, hidden)
+
+    def _encode_proprio(self, proprio: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
+        """Embed proprio tokens and tag them with time metadata."""
+        tokens = self.proprio_encoder(proprio)  # (B, N_time, hidden)
+        tokens = tokens + time_emb  # (B, N_time, hidden)
         return tokens
+
+    def _encode_pointcloud(
+        self,
+        points: torch.Tensor,
+        colors: torch.Tensor,
+        time_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Embed every point and flatten across timesteps into transformer tokens."""
+        features = torch.cat([points, colors], dim=-1)  # (B, N_time, N_pts, point_feature_dim)
+        per_point = self.point_feature_proj(features)  # (B, N_time, N_pts, hidden)
+        tokens = per_point + time_emb.unsqueeze(-2)  # (B, N_time, N_pts, hidden)
+        return tokens.reshape(tokens.shape[0], -1, tokens.shape[-1])  # (B, N_time*N_pts, hidden)
+
+    def _encode_context(
+        self,
+        proprio: torch.Tensor,
+        points: torch.Tensor,
+        colors: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build the observation token block (proprio + point cloud)."""
+        batch_size = proprio.shape[0]
+        time_emb = self._context_time_embedding(batch_size, proprio.device)  # (B, N_time, hidden)
+        proprio_tokens = self._encode_proprio(proprio, time_emb)  # (B, N_time, hidden)
+        point_tokens = self._encode_pointcloud(points, colors, time_emb)  # (B, N_time*N_pts, hidden)
+        return torch.cat([proprio_tokens, point_tokens], dim=1)  # (B, N_time + N_time*N_pts, hidden)
 
     def _encode_actions(self, actions: torch.Tensor) -> torch.Tensor:
         # Embed the (possibly noisy) action tokens using the same hidden dimensionality.
-        tokens = self.action_encoder(actions)  # (B, Ta, D)
+        tokens = self.action_encoder(actions)  # (B, N_action, hidden)
         batch = tokens.shape[0]
-        times = self.action_time_indices.expand(batch, -1) + float(self.cfg.context_length)  # (B, Ta)
-        time_emb = self.world_time_embedder(times)  # (B, Ta, D)
-        tokens = tokens + time_emb  # (B, Ta, D)
-        tokens = tokens + self.node_type_embeddings[1].view(1, 1, -1)  # (B, Ta, D)
-        return tokens
+        times = self.action_time_indices.to(device=actions.device, dtype=torch.float32)
+        times = times.expand(batch, -1) + float(self.cfg.context_length)  # (B, N_action)
+        time_emb = self.world_time_embedder(times)  # (B, N_action, hidden)
+        return tokens + time_emb  # (B, N_action, hidden)
 
     def _diffusion_condition(self, timesteps: torch.Tensor) -> torch.Tensor:
         # Encode the diffusion step and project it so AdaLN-Zero can modulate residual streams.
-        emb = self.diffusion_time_embedder(timesteps.float().unsqueeze(1))[:, 0, :]  # (B, D)
-        return self.diffusion_proj(emb)  # (B, D)
+        emb = self.diffusion_time_embedder(timesteps.float().unsqueeze(1))[:, 0, :]  # (B, hidden)
+        return self.diffusion_proj(emb)  # (B, hidden)
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         # Pull raw observations and actions from the dataloader mini-batch.
-        observations = batch["observations"]
+        proprio = batch["proprio"]
+        observation = batch["observation"]
+        points = observation["positions"]
+        colors = observation["colors"]
         actions = batch["actions"]
+
+        if proprio.shape[1] != self.cfg.context_length:
+            raise ValueError(
+                f"Expected context length {self.cfg.context_length}, "
+                f"got {proprio.shape[1]}."
+            )
+        if points.shape[1] != self.cfg.context_length:
+            raise ValueError(
+                f"Point cloud context mismatch: expected {self.cfg.context_length}, "
+                f"got {points.shape[1]}."
+            )
 
         # Sample standard Gaussian noise for the forward diffusion process.
         noise = torch.randn_like(actions)  # (B, Ta, action_dim)
@@ -170,13 +218,13 @@ class DiTDiffusionPolicy(nn.Module):
         noisy_actions = self.scheduler.add_noise(actions, noise, timesteps)  # (B, Ta, action_dim)
 
         # Convert clean observations and perturbed actions into joint token sequence.
-        obs_tokens = self._encode_observations(observations)  # (B, To, D)
+        context_tokens = self._encode_context(proprio, points, colors)  # (B, To + To*P, D)
         action_tokens = self._encode_actions(noisy_actions)  # (B, Ta, D)
-        tokens = torch.cat([obs_tokens, action_tokens], dim=1)  # (B, To+Ta, D)
+        tokens = torch.cat([context_tokens, action_tokens], dim=1)  # (B, 2*To+Ta, D)
 
         # Condition the DiT backbone on the diffusion timestep embedding.
         diffusion_cond = self._diffusion_condition(timesteps)  # (B, D)
-        encoded = self.transformer(tokens, diffusion_time_cond=diffusion_cond)  # (B, To+Ta, D)
+        encoded = self.transformer(tokens, diffusion_time_cond=diffusion_cond)  # (B, 2*To+Ta, D)
 
         # Take the tail slice corresponding to action tokens and predict the de-noised residual.
         pred = self.output_head(encoded[:, -self.cfg.horizon :, :])  # (B, Ta, action_dim)
@@ -190,11 +238,27 @@ class DiTDiffusionPolicy(nn.Module):
         return self.compute_loss(batch)
 
     def sample_actions(
-        self, observations: torch.Tensor, generator: Optional[torch.Generator] = None
+        self,
+        proprio: torch.Tensor,
+        observation: Dict[str, torch.Tensor],
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         # Infer batch sizing so the sampler emits a matching action rollout.
-        batch_size = observations.shape[0]  # ()
-        device = observations.device  # torch.device
+        batch_size = proprio.shape[0]  # ()
+        device = proprio.device  # torch.device
+
+        if proprio.shape[1] != self.cfg.context_length:
+            raise ValueError(
+                f"Expected context length {self.cfg.context_length}, "
+                f"got {proprio.shape[1]}."
+            )
+        points = observation["positions"]
+        colors = observation["colors"]
+        if points.shape[1] != self.cfg.context_length:
+            raise ValueError(
+                f"Point cloud context mismatch: expected {self.cfg.context_length}, "
+                f"got {points.shape[1]}."
+            )
 
         # Prepare a Gaussian starting point for the reverse diffusion trajectory.
         sample = torch.randn(
@@ -204,7 +268,9 @@ class DiTDiffusionPolicy(nn.Module):
         )  # (B, Ta, action_dim)
 
         # Encode observations once since they stay fixed throughout denoising.
-        obs_tokens = self._encode_observations(observations)  # (B, To, D)
+        context_tokens = self._encode_context(
+            proprio, points, colors
+        )  # (B, To + To*P, D)
 
         # Configure the scheduler timesteps for inference.
         self.scheduler.set_timesteps(self.num_inference_steps, device=device)  # (num_steps,)
@@ -223,7 +289,7 @@ class DiTDiffusionPolicy(nn.Module):
             action_tokens = self._encode_actions(sample)  # (B, Ta, D)
 
             # Concatenate observation and action tokens for joint attention.
-            tokens = torch.cat([obs_tokens, action_tokens], dim=1)  # (B, To+Ta, D)
+            tokens = torch.cat([context_tokens, action_tokens], dim=1)  # (B, 2*To+Ta, D)
 
             # Generate the adaptive LayerNorm modulation from the diffusion timestep.
             diffusion_cond = self._diffusion_condition(timesteps)  # (B, D)
@@ -232,7 +298,7 @@ class DiTDiffusionPolicy(nn.Module):
             encoded = self.transformer(
                 tokens,
                 diffusion_time_cond=diffusion_cond,
-            )  # (B, To+Ta, D)
+            )  # (B, 2*To+Ta, D)
 
             # Project the action slice back into the action space to recover noise estimates.
             noise_pred = self.output_head(encoded[:, -self.cfg.horizon :, :])  # (B, Ta, action_dim)

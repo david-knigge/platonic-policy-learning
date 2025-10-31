@@ -9,6 +9,25 @@ def point_cloud_with_actions(
     predicted_actions: torch.Tensor,
     gt_actions: torch.Tensor,
 ) -> wandb.Object3D:
+    if isinstance(point_cloud_sequence, dict):
+        points = point_cloud_sequence["points"]
+        colors = point_cloud_sequence["colors"]
+        masks = point_cloud_sequence.get("masks")
+        if points.ndim == 4:  # (B, T, P, 3) -> take first batch element
+            points = points[0]
+            colors = colors[0]
+            masks = masks[0] if masks is not None else None
+        frames = []
+        for t in range(points.shape[0]):
+            frame = {
+                "points": points[t],
+                "colors": colors[t],
+            }
+            if masks is not None:
+                frame["masks"] = masks[t]
+            frames.append(frame)
+        point_cloud_sequence = frames
+
     frame = point_cloud_sequence[-1]
     points = frame["points"].reshape(-1, 3).detach().cpu().to(torch.float32)
     colors = frame["colors"].reshape(-1, 3).detach().cpu().to(torch.float32)
