@@ -17,66 +17,55 @@ from src.utils.geometry import (
 
 
 # ---------------------------------------------------------------------------
-def _pose_to_features(pose: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _pose_to_components(
+    pose: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Convert pose tensors into a (scalar, vector) feature pair understood by the
-    transformer.
+    Decompose pose tensors into scalar, orientation-vector, and position slots.
 
     - Scalars: gripper open/close values.
-    - Vectors: end-effector position, forward axis, and upward axis.
+    - Orientation vectors: forward/up axes spanning the gripper frame.
+    - Positions: end-effector positions in Cartesian space.
     """
-    # pose shape: (..., 8) -> (x, y, z, qx, qy, qz, qw, grasp)
     position = pose[..., :3]  # (..., 3)
     quaternion = pose[..., 3:7]  # (..., 4)
-    grasp = pose[..., 7:]  # (..., 1)
-    forward, right, up = quaternion_to_frame(quaternion)  # each (..., 3)
-    # We retain only forward/up for the vector features; right can be recovered.
-    vectors = torch.stack(
-        [position, forward, up],
-        dim=-2,
-    )  # (..., 3, 3)
-    return grasp, vectors
+    grasp = pose[..., 7:8]  # (..., 1)
+    forward, _, up = quaternion_to_frame(quaternion)  # each (..., 3)
+    orientation = torch.stack([forward, up], dim=-2)  # (..., 2, 3)
+    return grasp, orientation, position
 
 
-def _features_to_pose(
+def _components_to_pose(
     grasp: torch.Tensor,
-    vectors: torch.Tensor,
+    orientation: torch.Tensor,
+    position: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Reconstruct the original pose tensor from scalar/vector features.
-
-    The first vector channel is treated as position; the remaining channels
-    correspond to forward/up axes spanning the gripper frame.
-    """
-    position = vectors[..., 0, :]  # (..., 3)
-    forward = vectors[..., 1, :]  # (..., 3)
-    up = vectors[..., 2, :]  # (..., 3)
+    """Reconstruct pose tensors from scalar, orientation, and position slots."""
+    forward = orientation[..., 0, :]  # (..., 3)
+    up = orientation[..., 1, :]  # (..., 3)
     quaternion = frame_to_quaternion(forward, up)  # (..., 4)
     return torch.cat([position, quaternion, grasp], dim=-1)  # (..., 8)
 
 
-def _pack_features(grasp: torch.Tensor, vectors: torch.Tensor) -> torch.Tensor:
-    """Flatten vector/scalar channels so the DDPM scheduler can inject noise."""
-    # vectors shape: (B, T, 3 vectors, 3 dims) -> flatten vector axes.
-    vector_flat = vectors.reshape(*vectors.shape[:-2], -1)  # (..., 9)
-    return torch.cat([vector_flat, grasp], dim=-1)  # (..., 10)
+def _pack_components(
+    grasp: torch.Tensor,
+    orientation: torch.Tensor,
+    position: torch.Tensor,
+) -> torch.Tensor:
+    """Flatten orientation vectors and concatenate positions + scalars."""
+    orientation_flat = orientation.reshape(*orientation.shape[:-2], -1)  # (..., 6)
+    return torch.cat([orientation_flat, position, grasp], dim=-1)  # (..., 10)
 
 
-def _unpack_features(
+def _unpack_components(
     tensor: torch.Tensor,
-    *,
-    vector_channels: int,
-    scalar_channels: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Inverse operation of :func:`_pack_features`."""
-    if scalar_channels == 0:
-        grasp = tensor.new_zeros(*tensor.shape[:-1], 0)
-        vector_flat = tensor
-    else:
-        grasp = tensor[..., -scalar_channels:]
-        vector_flat = tensor[..., :-scalar_channels]
-    vectors = vector_flat.view(*tensor.shape[:-1], vector_channels, 3)
-    return grasp, vectors
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Inverse of :func:`_pack_components`."""
+    orientation_flat = tensor[..., :6]
+    position = tensor[..., 6:9]
+    grasp = tensor[..., 9:]
+    orientation = orientation_flat.view(*tensor.shape[:-1], 2, 3)
+    return grasp, orientation, position
 
 
 # ---------------------------------------------------------------------------
@@ -120,9 +109,11 @@ class PlatonicDiffusionPolicyConfig:
     num_inference_steps: int = 50
 
     # Count of scalar channels in packed action tokens.
-    scalar_channels: int = 1
-    # Count of vector channels (each a 3D feature).
-    vector_channels: int = 3
+    scalar_channels: int = 4
+    # Number of vector-valued feature channels supplied on input.
+    input_vector_channels: int = 2
+    # Number of vector-valued channels predicted by the transformer head.
+    output_vector_channels: int = 3
     # Amount of DDIM stochasticity (0 = fully deterministic sampler).
     ddim_eta: float = 0.0
 
@@ -146,10 +137,10 @@ class PlatonicDiffusionPolicy(nn.Module):
 
         self.transformer = DensePlatonicTransformer(
             input_dim=cfg.scalar_channels,
-            input_dim_vec=cfg.vector_channels,
+            input_dim_vec=cfg.input_vector_channels,
             hidden_dim=cfg.hidden_dim,
             output_dim=cfg.scalar_channels,
-            output_dim_vec=cfg.vector_channels,
+            output_dim_vec=cfg.output_vector_channels,
             nhead=cfg.num_heads,
             num_layers=cfg.num_layers,
             solid_name=cfg.solid_name,
@@ -165,6 +156,30 @@ class PlatonicDiffusionPolicy(nn.Module):
             time_conditioning=True,
         )
 
+        # Separate scalar embedders for proprio, actions, and per-point colours.
+        self.proprio_scalar_encoder = nn.Sequential(
+            nn.Linear(1, cfg.scalar_channels),
+            nn.SiLU(),
+            nn.Linear(cfg.scalar_channels, cfg.scalar_channels),
+        )
+        self.action_scalar_encoder = nn.Sequential(
+            nn.Linear(1, cfg.scalar_channels),
+            nn.SiLU(),
+            nn.Linear(cfg.scalar_channels, cfg.scalar_channels),
+        )
+        self.action_scalar_decoder = nn.Linear(cfg.scalar_channels, 1)
+        self.point_rgb_encoder = nn.Sequential(
+            nn.Linear(3, cfg.scalar_channels),
+            nn.SiLU(),
+            nn.Linear(cfg.scalar_channels, cfg.scalar_channels),
+        )
+
+        # Orientation occupies two vector channels; channel 0 remains reserved for positions.
+        self.orientation_channels = self.cfg.input_vector_channels
+        if self.cfg.output_vector_channels < self.orientation_channels + 1:
+            raise ValueError("output_vector_channels must be at least orientation_channels + 1.")
+        self.packed_action_dim = self.orientation_channels * 3 + 3 + 1  # (orientation, position, gripper)
+
     # ------------------------------------------------------------------
     # Utility helpers
 
@@ -176,23 +191,38 @@ class PlatonicDiffusionPolicy(nn.Module):
         self,
         obs_scalars: torch.Tensor,
         obs_vectors: torch.Tensor,
-        action_scalars: torch.Tensor,
-        action_vectors: torch.Tensor,
+        obs_positions: torch.Tensor,
+        action_gripper: torch.Tensor,
+        action_orientation: torch.Tensor,
+        action_positions: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
         """Run the transformer and predict action-token noise."""
-        # obs_scalars: (B, To, 1), action_scalars: (B, Ta, 1)
+        # Embed action scalars so transformer sees rich scalar features.
+        action_scalar_features = self.action_scalar_encoder(action_gripper)  # (B, N_action, scalar_channels)
+
+        # Only orientation is provided through vector features; positions live in the `pos` argument.
+        B, N_action = action_orientation.shape[:2]
+        action_vector_features = torch.zeros(
+            B,
+            N_action,
+            self.cfg.input_vector_channels,
+            3,
+            device=action_orientation.device,
+            dtype=action_orientation.dtype,
+        )
+        action_vector_features[..., : self.orientation_channels, :] = action_orientation
+
+        # Concatenate context tokens with the (noisy) action tokens.
         tokens_scalars = torch.cat(
-            [obs_scalars, action_scalars],
+            [obs_scalars, action_scalar_features],
             dim=1,
-        )  # (B, To + Ta, 1)
-        # obs_vectors: (B, To, 3, 3), action_vectors: (B, Ta, 3, 3)
+        )
         tokens_vectors = torch.cat(
-            [obs_vectors, action_vectors],
+            [obs_vectors, action_vector_features],
             dim=1,
-        )  # (B, To + Ta, 3, 3)
-        # Feed the position channel (index 0) as absolute coordinates.
-        token_positions = tokens_vectors[..., 0, :]  # (B, To + Ta, 3)
+        )
+        token_positions = torch.cat([obs_positions, action_positions], dim=1)
 
         scalar_pred, vector_pred = self.transformer(
             scalars=tokens_scalars,
@@ -202,31 +232,81 @@ class PlatonicDiffusionPolicy(nn.Module):
         )
 
         # Transformer returns predictions for both context + horizon tokens.
-        pred_scalars = scalar_pred[:, -self.cfg.horizon :, :]  # (B, Ta, 1)
+        pred_scalar_features = scalar_pred[:, -self.cfg.horizon :, :]  # (B, N_action, scalar_channels)
         pred_vectors = vector_pred[
             :,
             -self.cfg.horizon :,
             :,
             :,
-        ]  # (B, Ta, 3, 3)
-        return _pack_features(pred_scalars, pred_vectors)
+        ]  # (B, N_action, output_vector_channels, 3)
+        pred_gripper = self.action_scalar_decoder(pred_scalar_features)  # (B, N_action, 1)
+        pred_orientation = pred_vectors[..., 1:, :]  # (B, N_action, 2, 3)
+        pred_positions = pred_vectors[..., 0, :]  # (B, N_action, 3)
+        return _pack_components(pred_gripper, pred_orientation, pred_positions)
 
-    def _split_observations(
+    def _build_context_tokens(
         self,
-        observations: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convert raw proprio tensors into scalar/vector channels."""
-        grasp, vectors = _pose_to_features(
-            observations
-        )  # (B, To, 1), (B, To, 3, 3)
-        return grasp, vectors
+        proprio: torch.Tensor,
+        point_cloud: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Combine proprio and point cloud observations into transformer tokens."""
+        proprio_gripper, proprio_orientation, proprio_position = _pose_to_components(proprio)
+        anchor = proprio_position[:, 0, :].clone()  # (B, 3)
+        proprio_position = proprio_position - anchor[:, None, :]
+
+        B, N_time = proprio.shape[:2]
+        device = proprio.device
+        dtype = proprio.dtype
+
+        proprio_scalars = self.proprio_scalar_encoder(proprio_gripper)  # (B, N_time, scalar_channels)
+        proprio_vectors = torch.zeros(
+            B,
+            N_time,
+            self.cfg.input_vector_channels,
+            3,
+            device=device,
+            dtype=dtype,
+        )
+        proprio_vectors[..., : self.orientation_channels, :] = proprio_orientation
+
+        proprio_positions = proprio_position  # (B, N_time, 3)
+
+        if point_cloud is None:
+            return proprio_scalars, proprio_vectors, proprio_positions, anchor
+
+        points = point_cloud["positions"].to(device=device, dtype=dtype)
+        colors = point_cloud["colors"].to(device=device, dtype=dtype)
+        _, _, N_points, _ = points.shape
+
+        points = points - anchor[:, None, None, :]
+
+        point_scalars = self.point_rgb_encoder(
+            colors.reshape(B, N_time * N_points, 3)
+        )  # (B, N_time * N_points, scalar_channels)
+        point_vectors = torch.zeros(
+            B,
+            N_time * N_points,
+            self.cfg.input_vector_channels,
+            3,
+            device=device,
+            dtype=dtype,
+        )
+        point_positions = points.reshape(B, N_time * N_points, 3)
+
+        combined_scalars = torch.cat([proprio_scalars, point_scalars], dim=1)
+        combined_vectors = torch.cat([proprio_vectors, point_vectors], dim=1)
+        combined_positions = torch.cat([proprio_positions, point_positions], dim=1)
+        return combined_scalars, combined_vectors, combined_positions, anchor
 
     def _split_actions(
         self,
         actions: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Wrapper for readability – matches observation splitter."""
-        return self._split_observations(actions)
+        anchor: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Convert action poses into scalar/vector slots centred at the anchor."""
+        gripper, orientation, position = _pose_to_components(actions)
+        position = position - anchor[:, None, :]
+        return gripper, orientation, position
 
     # ------------------------------------------------------------------
     # Diffusion interface
@@ -235,23 +315,19 @@ class PlatonicDiffusionPolicy(nn.Module):
         self,
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        observations = batch["observations"]
+        proprio = batch["proprio"]
+        point_cloud = batch.get("point_cloud")
         actions = batch["actions"]
 
-        # Convert tensors into the scalar/vector form used by the backbone.
-        obs_scalars, obs_vectors = self._split_observations(
-            observations
-        )  # (B, To, 1/3/3)
-        action_scalars, action_vectors = self._split_actions(
-            actions
-        )  # (B, Ta, 1/3/3)
+        obs_scalars, obs_vectors, obs_positions, anchor = self._build_context_tokens(
+            proprio,
+            point_cloud,
+        )
+        action_gripper, action_orientation, action_positions = self._split_actions(actions, anchor)
 
-        # Pack vectors + scalars so the scheduler operates in a flat space.
-        action_model = _pack_features(
-            action_scalars,
-            action_vectors,
-        )  # (B, Ta, 10)
-        noise = torch.randn_like(action_model)  # Gaussian noise ~ (B, Ta, 10)
+        # Pack orientation, position, and scalar slots so the scheduler operates in a flat space.
+        action_model = _pack_components(action_gripper, action_orientation, action_positions)
+        noise = torch.randn_like(action_model)
 
         # Sample diffusion timesteps and run forward diffusion.
         timesteps = torch.randint(
@@ -265,19 +341,19 @@ class PlatonicDiffusionPolicy(nn.Module):
             action_model,
             noise,
             timesteps,
-        )  # (B, Ta, 10)
-        noisy_scalars, noisy_vectors = _unpack_features(
+        )  # (B, N_action, 10)
+        noisy_gripper, noisy_orientation, noisy_positions = _unpack_components(
             noisy_actions,
-            vector_channels=self.cfg.vector_channels,
-            scalar_channels=self.cfg.scalar_channels,
         )
 
         # Predict the Gaussian noise residual under the Platonic transformer.
         pred_noise = self._tokenise(
             obs_scalars,
             obs_vectors,
-            noisy_scalars,
-            noisy_vectors,
+            obs_positions,
+            noisy_gripper,
+            noisy_orientation,
+            noisy_positions,
             timesteps,
         )
 
@@ -294,7 +370,8 @@ class PlatonicDiffusionPolicy(nn.Module):
 
     def sample_actions(
         self,
-        observations: torch.Tensor,
+        proprio: torch.Tensor,
+        point_cloud: Optional[Dict[str, torch.Tensor]] = None,
         generator: Optional[torch.Generator] = None,
         initial_noise: Optional[torch.Tensor] = None,
         *,
@@ -302,9 +379,10 @@ class PlatonicDiffusionPolicy(nn.Module):
         return_features: bool = False,
     ) -> torch.Tensor:
         # Tokenise observations once; they stay fixed during ancestral sampling.
-        obs_scalars, obs_vectors = self._split_observations(
-            observations
-        )  # (B, To, 1/3/3)
+        obs_scalars, obs_vectors, obs_positions, anchor = self._build_context_tokens(
+            proprio,
+            point_cloud,
+        )
 
         # Configure the reverse diffusion schedule on the current device.
         self.scheduler.set_timesteps(
@@ -317,9 +395,9 @@ class PlatonicDiffusionPolicy(nn.Module):
             sample = initial_noise.to(device=self.device)
         else:
             sample_shape = (
-                observations.shape[0],
+                proprio.shape[0],
                 self.cfg.horizon,
-                self.cfg.vector_channels * 3 + self.cfg.scalar_channels,
+                self.packed_action_dim,
             )
             sample = torch.randn(
                 sample_shape,
@@ -330,13 +408,11 @@ class PlatonicDiffusionPolicy(nn.Module):
         # Sweep the configured inference timesteps in reverse order.
         for timestep in self.scheduler.timesteps:
             # Convert packed action state into scalar/vector view for the model.
-            noisy_scalars, noisy_vectors = _unpack_features(
+            noisy_gripper, noisy_orientation, noisy_positions = _unpack_components(
                 sample,
-                vector_channels=self.cfg.vector_channels,
-                scalar_channels=self.cfg.scalar_channels,
             )
             timestep_tensor = torch.full(
-                (observations.shape[0],),
+                (proprio.shape[0],),
                 timestep,
                 device=self.device,
                 dtype=torch.long,
@@ -345,8 +421,10 @@ class PlatonicDiffusionPolicy(nn.Module):
             noise_pred = self._tokenise(
                 obs_scalars,
                 obs_vectors,
-                noisy_scalars,
-                noisy_vectors,
+                obs_positions,
+                noisy_gripper,
+                noisy_orientation,
+                noisy_positions,
                 timestep_tensor,
             )
 
@@ -360,20 +438,26 @@ class PlatonicDiffusionPolicy(nn.Module):
                 eta=eta,
                 generator=generator,
             )
-            # Feed the next iterate back into the loop in packed (B, Ta, 10) form.
-            sample = scheduler_step.prev_sample.to(dtype=observations.dtype)
+            # Feed the next iterate back into the loop in packed form.
+            sample = scheduler_step.prev_sample.to(dtype=proprio.dtype)
 
         # After finishing the reverse process, convert back into pose tensors.
-        final_scalars, final_vectors = _unpack_features(
+        final_gripper, final_orientation, final_positions = _unpack_components(
             sample,
-            vector_channels=self.cfg.vector_channels,
-            scalar_channels=self.cfg.scalar_channels,
         )
+        final_positions = final_positions + anchor[:, None, :]
         if return_features:
-            return final_scalars, final_vectors
+            return final_gripper, final_orientation, final_positions
         # Convert the final scalar/vector representation back into pose layout.
-        actions = _features_to_pose(final_scalars, final_vectors)
+        actions = _components_to_pose(final_gripper, final_orientation, final_positions)
         return actions
 
 
-__all__ = ["PlatonicDiffusionPolicy", "PlatonicDiffusionPolicyConfig"]
+__all__ = [
+    "PlatonicDiffusionPolicy",
+    "PlatonicDiffusionPolicyConfig",
+    "_pose_to_components",
+    "_components_to_pose",
+    "_pack_components",
+    "_unpack_components",
+]

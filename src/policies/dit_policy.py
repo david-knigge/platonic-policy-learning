@@ -140,12 +140,12 @@ class DiTDiffusionPolicy(nn.Module):
         """Absolute time indices for the context window."""
         times = self.context_time_indices.to(device=device, dtype=torch.float32)  # (1, N_time)
         times = times.expand(batch_size, -1)  # (B, N_time)
-        return self.world_time_embedder(times)  # (B, N_time, hidden)
+        return self.world_time_embedder(times)  # (B, N_time, hidden_dim)
 
     def _encode_proprio(self, proprio: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         """Embed proprio tokens and tag them with time metadata."""
-        tokens = self.proprio_encoder(proprio)  # (B, N_time, hidden)
-        tokens = tokens + time_emb  # (B, N_time, hidden)
+        tokens = self.proprio_encoder(proprio)  # (B, N_time, hidden_dim)
+        tokens = tokens + time_emb  # (B, N_time, hidden_dim)
         return tokens
 
     def _encode_pointcloud(
@@ -155,10 +155,10 @@ class DiTDiffusionPolicy(nn.Module):
         time_emb: torch.Tensor,
     ) -> torch.Tensor:
         """Embed every point and flatten across timesteps into transformer tokens."""
-        features = torch.cat([points, colors], dim=-1)  # (B, N_time, N_pts, point_feature_dim)
-        per_point = self.point_feature_proj(features)  # (B, N_time, N_pts, hidden)
-        tokens = per_point + time_emb.unsqueeze(-2)  # (B, N_time, N_pts, hidden)
-        return tokens.reshape(tokens.shape[0], -1, tokens.shape[-1])  # (B, N_time*N_pts, hidden)
+        features = torch.cat([points, colors], dim=-1)  # (B, N_time, N_points, point_feature_dim)
+        per_point = self.point_feature_proj(features)  # (B, N_time, N_points, hidden_dim)
+        tokens = per_point + time_emb.unsqueeze(-2)  # (B, N_time, N_points, hidden_dim)
+        return tokens.reshape(tokens.shape[0], -1, tokens.shape[-1])  # (B, N_time * N_points, hidden_dim)
 
     def _encode_context(
         self,
@@ -168,29 +168,31 @@ class DiTDiffusionPolicy(nn.Module):
     ) -> torch.Tensor:
         """Build the observation token block (proprio + point cloud)."""
         batch_size = proprio.shape[0]
-        time_emb = self._context_time_embedding(batch_size, proprio.device)  # (B, N_time, hidden)
-        proprio_tokens = self._encode_proprio(proprio, time_emb)  # (B, N_time, hidden)
-        point_tokens = self._encode_pointcloud(points, colors, time_emb)  # (B, N_time*N_pts, hidden)
-        return torch.cat([proprio_tokens, point_tokens], dim=1)  # (B, N_time + N_time*N_pts, hidden)
+        time_emb = self._context_time_embedding(batch_size, proprio.device)  # (B, N_time, hidden_dim)
+        proprio_tokens = self._encode_proprio(proprio, time_emb)  # (B, N_time, hidden_dim)
+        point_tokens = self._encode_pointcloud(points, colors, time_emb)  # (B, N_time * N_points, hidden_dim)
+        return torch.cat([proprio_tokens, point_tokens], dim=1)  # (B, N_observation_tokens, hidden_dim)
 
     def _encode_actions(self, actions: torch.Tensor) -> torch.Tensor:
         # Embed the (possibly noisy) action tokens using the same hidden dimensionality.
-        tokens = self.action_encoder(actions)  # (B, N_action, hidden)
+        tokens = self.action_encoder(actions)  # (B, N_action, hidden_dim)
         batch = tokens.shape[0]
         times = self.action_time_indices.to(device=actions.device, dtype=torch.float32)
         times = times.expand(batch, -1) + float(self.cfg.context_length)  # (B, N_action)
-        time_emb = self.world_time_embedder(times)  # (B, N_action, hidden)
-        return tokens + time_emb  # (B, N_action, hidden)
+        time_emb = self.world_time_embedder(times)  # (B, N_action, hidden_dim)
+        return tokens + time_emb  # (B, N_action, hidden_dim)
 
     def _diffusion_condition(self, timesteps: torch.Tensor) -> torch.Tensor:
         # Encode the diffusion step and project it so AdaLN-Zero can modulate residual streams.
-        emb = self.diffusion_time_embedder(timesteps.float().unsqueeze(1))[:, 0, :]  # (B, hidden)
-        return self.diffusion_proj(emb)  # (B, hidden)
+        emb = self.diffusion_time_embedder(timesteps.float().unsqueeze(1))[:, 0, :]  # (B, hidden_dim)
+        return self.diffusion_proj(emb)  # (B, hidden_dim)
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         # Pull raw observations and actions from the dataloader mini-batch.
         proprio = batch["proprio"]
-        observation = batch["observation"]
+        observation = batch.get("observation")
+        if observation is None:
+            observation = batch["point_cloud"]
         points = observation["positions"]
         colors = observation["colors"]
         actions = batch["actions"]
@@ -207,7 +209,7 @@ class DiTDiffusionPolicy(nn.Module):
             )
 
         # Sample standard Gaussian noise for the forward diffusion process.
-        noise = torch.randn_like(actions)  # (B, Ta, action_dim)
+        noise = torch.randn_like(actions)  # (B, N_action, action_dim)
         timesteps = torch.randint(
             0,
             self.scheduler.config.num_train_timesteps,
@@ -215,19 +217,19 @@ class DiTDiffusionPolicy(nn.Module):
             device=actions.device,
             dtype=torch.long,
         )  # (B,)
-        noisy_actions = self.scheduler.add_noise(actions, noise, timesteps)  # (B, Ta, action_dim)
+        noisy_actions = self.scheduler.add_noise(actions, noise, timesteps)  # (B, N_action, action_dim)
 
         # Convert clean observations and perturbed actions into joint token sequence.
-        context_tokens = self._encode_context(proprio, points, colors)  # (B, To + To*P, D)
-        action_tokens = self._encode_actions(noisy_actions)  # (B, Ta, D)
-        tokens = torch.cat([context_tokens, action_tokens], dim=1)  # (B, 2*To+Ta, D)
+        context_tokens = self._encode_context(proprio, points, colors)  # (B, N_observation_tokens, hidden_dim)
+        action_tokens = self._encode_actions(noisy_actions)  # (B, N_action, hidden_dim)
+        tokens = torch.cat([context_tokens, action_tokens], dim=1)  # (B, N_observation_tokens + N_action, hidden_dim)
 
         # Condition the DiT backbone on the diffusion timestep embedding.
-        diffusion_cond = self._diffusion_condition(timesteps)  # (B, D)
-        encoded = self.transformer(tokens, diffusion_time_cond=diffusion_cond)  # (B, 2*To+Ta, D)
+        diffusion_cond = self._diffusion_condition(timesteps)  # (B, hidden_dim)
+        encoded = self.transformer(tokens, diffusion_time_cond=diffusion_cond)  # (B, N_observation_tokens + N_action, hidden_dim)
 
         # Take the tail slice corresponding to action tokens and predict the de-noised residual.
-        pred = self.output_head(encoded[:, -self.cfg.horizon :, :])  # (B, Ta, action_dim)
+        pred = self.output_head(encoded[:, -self.cfg.horizon :, :])  # (B, N_action, action_dim)
 
         # Compare the network prediction to the original Gaussian noise; return scalars for logging.
         loss = F.mse_loss(pred, noise)  # scalar
@@ -265,15 +267,15 @@ class DiTDiffusionPolicy(nn.Module):
             (batch_size, self.cfg.horizon, self.cfg.action_dim),
             generator=generator,
             device=device,
-        )  # (B, Ta, action_dim)
+        )  # (B, N_action, action_dim)
 
         # Encode observations once since they stay fixed throughout denoising.
         context_tokens = self._encode_context(
             proprio, points, colors
-        )  # (B, To + To*P, D)
+        )  # (B, N_observation_tokens, hidden_dim)
 
         # Configure the scheduler timesteps for inference.
-        self.scheduler.set_timesteps(self.num_inference_steps, device=device)  # (num_steps,)
+        self.scheduler.set_timesteps(self.num_inference_steps, device=device)  # (N_diffusion_steps,)
 
         # Replay the reverse diffusion process until we reach the clean action manifold.
         for timestep in self.scheduler.timesteps:  # (num_steps,)
@@ -286,22 +288,22 @@ class DiTDiffusionPolicy(nn.Module):
             )  # (B,)
 
             # Encode the current noisy action tokens under the DiT backbone space.
-            action_tokens = self._encode_actions(sample)  # (B, Ta, D)
+            action_tokens = self._encode_actions(sample)  # (B, N_action, hidden_dim)
 
             # Concatenate observation and action tokens for joint attention.
-            tokens = torch.cat([context_tokens, action_tokens], dim=1)  # (B, 2*To+Ta, D)
+            tokens = torch.cat([context_tokens, action_tokens], dim=1)  # (B, N_observation_tokens + N_action, hidden_dim)
 
             # Generate the adaptive LayerNorm modulation from the diffusion timestep.
-            diffusion_cond = self._diffusion_condition(timesteps)  # (B, D)
+            diffusion_cond = self._diffusion_condition(timesteps)  # (B, hidden_dim)
 
             # Run the DiT transformer to predict the score (noise) at this timestep.
             encoded = self.transformer(
                 tokens,
                 diffusion_time_cond=diffusion_cond,
-            )  # (B, 2*To+Ta, D)
+            )  # (B, N_observation_tokens + N_action, hidden_dim)
 
             # Project the action slice back into the action space to recover noise estimates.
-            noise_pred = self.output_head(encoded[:, -self.cfg.horizon :, :])  # (B, Ta, action_dim)
+            noise_pred = self.output_head(encoded[:, -self.cfg.horizon :, :])  # (B, N_action, action_dim)
 
             # Apply the scheduler update to obtain the next, slightly cleaner action sample.
             scheduler_output = self.scheduler.step(
@@ -309,12 +311,12 @@ class DiTDiffusionPolicy(nn.Module):
                 timestep,
                 sample,
                 generator=generator,
-            )  # prev_sample: (B, Ta, action_dim)
+            )  # prev_sample: (B, N_action, action_dim)
 
-            sample = scheduler_output.prev_sample  # (B, Ta, action_dim)
+            sample = scheduler_output.prev_sample  # (B, N_action, action_dim)
 
         # Return the denoised actions matching the dataset's action tensor layout.
-        return sample  # (B, Ta, action_dim)
+        return sample  # (B, N_action, action_dim)
 
 
 __all__ = ["DiTDiffusionPolicy", "DiTDiffusionPolicyConfig"]

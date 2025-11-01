@@ -1,10 +1,10 @@
 import torch
 
 from src.policies.platonic_policy import (
-    _features_to_pose,
-    _pack_features,
-    _pose_to_features,
-    _unpack_features,
+    _components_to_pose,
+    _pack_components,
+    _pose_to_components,
+    _unpack_components,
 )
 from src.utils.geometry import matrix_to_quaternion, quaternion_to_matrix
 
@@ -33,8 +33,8 @@ def test_pose_feature_round_trip():
     gripper = torch.rand(2, 3, 1)
     pose = torch.cat([position, quaternion, gripper], dim=-1)  # (2, 3, 8)
 
-    scalars, vectors = _pose_to_features(pose)
-    recovered = _features_to_pose(scalars, vectors)
+    grasp, orientation, position_comp = _pose_to_components(pose)
+    recovered = _components_to_pose(grasp, orientation, position_comp)
 
     # Account for quaternion sign ambiguity before comparing.
     canonical = pose.clone()
@@ -51,11 +51,11 @@ def test_pose_feature_round_trip():
 
 def test_pack_unpack_symmetry():
     """Packing action features must be perfectly invertible."""
-    scalars = torch.randn(4, 6, 1)
-    vectors = torch.randn(4, 6, 3, 3)
-    packed = _pack_features(scalars, vectors)
-    unpack_scalars, unpack_vectors = _unpack_features(
-        packed, vector_channels=3, scalar_channels=1
-    )
-    assert torch.allclose(scalars, unpack_scalars)
-    assert torch.allclose(vectors, unpack_vectors)
+    grasp = torch.randn(4, 6, 1)
+    orientation = torch.randn(4, 6, 2, 3)
+    position = torch.randn(4, 6, 3)
+    packed = _pack_components(grasp, orientation, position)
+    unpack_grasp, unpack_orientation, unpack_position = _unpack_components(packed)
+    assert torch.allclose(grasp, unpack_grasp)
+    assert torch.allclose(orientation, unpack_orientation)
+    assert torch.allclose(position, unpack_position)

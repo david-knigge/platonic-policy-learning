@@ -8,10 +8,10 @@ from src.models.platonic_transformer.groups import PLATONIC_GROUPS
 from src.policies.platonic_policy import (
     PlatonicDiffusionPolicy,
     PlatonicDiffusionPolicyConfig,
-    _features_to_pose,
-    _pack_features,
-    _pose_to_features,
-    _unpack_features,
+    _components_to_pose,
+    _pack_components,
+    _pose_to_components,
+    _unpack_components,
 )
 from src.utils.geometry import quaternion_to_matrix
 
@@ -19,32 +19,19 @@ from src.utils.geometry import quaternion_to_matrix
 CACHE_ROOT = Path("/home/dknigge/project_dir/data/robotics/rlbench/imitation_learning")
 
 
-def _rotate_vectors(vectors: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
-    """Rotate the vector features (B, T, 3, 3) by a shared 3x3 rotation."""
-    return torch.einsum("ij,...kj->...ki", rotation, vectors)
-
-
-def _translate_vectors(vectors: torch.Tensor, translation: torch.Tensor) -> torch.Tensor:
-    """Translate the position channel (index 0) of vector features."""
-    translated = vectors.clone()
-    translated[..., 0, :] = translated[..., 0, :] + translation.to(
-        dtype=vectors.dtype, device=vectors.device
-    )
-    return translated
-
-
 def _rotate_pose_sequence(pose: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
     """Rotate pose tensors by first converting to the scalar/vector format."""
-    scalars, vectors = _pose_to_features(pose)
-    rotated_vectors = _rotate_vectors(vectors, rotation)
-    return _features_to_pose(scalars, rotated_vectors)
+    grasp, orientation, position = _pose_to_components(pose)
+    orientation = torch.einsum("ij,...kj->...ki", rotation, orientation)
+    position = torch.matmul(position, rotation.t())
+    return _components_to_pose(grasp, orientation, position)
 
 
 def _translate_pose_sequence(pose: torch.Tensor, translation: torch.Tensor) -> torch.Tensor:
     """Translate pose tensors by shifting position channels."""
-    scalars, vectors = _pose_to_features(pose)
-    translated_vectors = _translate_vectors(vectors, translation)
-    return _features_to_pose(scalars, translated_vectors)
+    grasp, orientation, position = _pose_to_components(pose)
+    position = position + translation.to(dtype=position.dtype, device=position.device)
+    return _components_to_pose(grasp, orientation, position)
 
 
 def _rototranslate_pose_sequence(
@@ -54,25 +41,64 @@ def _rototranslate_pose_sequence(
     return _translate_pose_sequence(_rotate_pose_sequence(pose, rotation), translation)
 
 
+def _rotate_point_cloud(
+    point_cloud: dict[str, torch.Tensor], rotation: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Rotate point cloud positions [B, N_time, N_pts, 3]; colours unaffected."""
+    positions = torch.matmul(
+        point_cloud["positions"], rotation.t()
+    )
+    return {
+        "positions": positions,
+        "colors": point_cloud["colors"],
+    }
+
+
+def _translate_point_cloud(
+    point_cloud: dict[str, torch.Tensor], translation: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Translate point cloud positions by a fixed vector."""
+    translation = translation.view(1, 1, 1, 3).to(
+        dtype=point_cloud["positions"].dtype,
+        device=point_cloud["positions"].device,
+    )
+    positions = point_cloud["positions"] + translation
+    return {
+        "positions": positions,
+        "colors": point_cloud["colors"],
+    }
+
+
+def _rototranslate_point_cloud(
+    point_cloud: dict[str, torch.Tensor],
+    rotation: torch.Tensor,
+    translation: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Apply rotation followed by translation to point cloud positions."""
+    rotated = _rotate_point_cloud(point_cloud, rotation)
+    return _translate_point_cloud(rotated, translation)
+
+
 def _rotate_packed(tensor: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
     """Rotate packed (flattened) action tensors used by the diffusion scheduler."""
-    scalars, vectors = _unpack_features(tensor, vector_channels=3, scalar_channels=1)
-    rotated_vectors = _rotate_vectors(vectors, rotation)
-    return _pack_features(scalars, rotated_vectors)
+    grasp, orientation, position = _unpack_components(tensor)
+    orientation = torch.einsum("ij,...kj->...ki", rotation, orientation)
+    position = torch.matmul(position, rotation.t())
+    return _pack_components(grasp, orientation, position)
 
 
 def _translate_packed(tensor: torch.Tensor, translation: torch.Tensor) -> torch.Tensor:
     """Translate the position channel within packed action tensors."""
-    scalars, vectors = _unpack_features(tensor, vector_channels=3, scalar_channels=1)
-    translated_vectors = _translate_vectors(vectors, translation)
-    return _pack_features(scalars, translated_vectors)
+    # Relative representation is translation invariant; no update required.
+    return tensor
 
 
 def _rototranslate_packed(
     tensor: torch.Tensor, rotation: torch.Tensor, translation: torch.Tensor
 ) -> torch.Tensor:
     """Apply rotation followed by translation within packed action tensors."""
-    return _translate_packed(_rotate_packed(tensor, rotation), translation)
+    rotated = _rotate_packed(tensor, rotation)
+    return _translate_packed(rotated, translation)
 
 
 def _fetch_batch():
@@ -84,7 +110,14 @@ def _fetch_batch():
         shuffle=False,
     )
     batch = next(iter(dataloader))
-    return batch["observation"]["proprio_sequence"], batch["action"]
+    proprio = batch["observation"]["proprio_sequence"]
+    point_cloud_raw = batch["observation"]["point_cloud_sequence"]
+    point_cloud = {
+        "positions": point_cloud_raw["points"],
+        "colors": point_cloud_raw["colors"],
+    }
+    actions = batch["action"]
+    return proprio, point_cloud, actions
 
 
 def _random_quaternion(batch_shape: tuple[int, ...]) -> torch.Tensor:
@@ -94,7 +127,7 @@ def _random_quaternion(batch_shape: tuple[int, ...]) -> torch.Tensor:
 
 def test_platonic_policy_equivariance():
     """Noise predictions should rotate exactly with inputs."""
-    observations, actions = _fetch_batch()
+    observations, point_cloud, actions = _fetch_batch()
     # observations shape: (B=1, T_obs, 8); actions shape: (B=1, T_action, 8)
     group = PLATONIC_GROUPS["icosahedron"]
 
@@ -118,9 +151,15 @@ def test_platonic_policy_equivariance():
     policy = PlatonicDiffusionPolicy(cfg).cpu()
     policy.eval()
 
-    obs_scalars, obs_vectors = policy._split_observations(observations)
-    action_scalars, action_vectors = policy._split_actions(actions)
-    action_model = _pack_features(action_scalars, action_vectors)  # (B, T_action, 10)
+    obs_scalars, obs_vectors, obs_positions, anchor = policy._build_context_tokens(
+        observations, point_cloud
+    )
+    action_gripper, action_orientation, action_positions = policy._split_actions(actions, anchor)
+    action_model = _pack_components(
+        action_gripper,
+        action_orientation,
+        action_positions,
+    )  # (B, T_action, 10)
 
     generator = torch.Generator().manual_seed(7)
     noise = torch.randn(
@@ -137,33 +176,46 @@ def test_platonic_policy_equivariance():
         dtype=torch.long,
     )
     noisy = policy.scheduler.add_noise(action_model, noise, timesteps)  # forward diffusion
-    noisy_scalars, noisy_vectors = _unpack_features(
-        noisy, vector_channels=3, scalar_channels=1
-    )
+    noisy_gripper, noisy_orientation, noisy_positions = _unpack_components(noisy)
     pred_noise = policy._tokenise(
-        obs_scalars, obs_vectors, noisy_scalars, noisy_vectors, timesteps
+        obs_scalars,
+        obs_vectors,
+        obs_positions,
+        noisy_gripper,
+        noisy_orientation,
+        noisy_positions,
+        timesteps,
     )
 
     rotation = group.elements[5].to(dtype=observations.dtype)
     observations_rot = _rotate_pose_sequence(observations, rotation)
+    point_cloud_rot = _rotate_point_cloud(point_cloud, rotation)
     actions_rot = _rotate_pose_sequence(actions, rotation)
 
-    obs_rot_scalars, obs_rot_vectors = policy._split_observations(observations_rot)
-    action_rot_scalars, action_rot_vectors = policy._split_actions(actions_rot)
-    action_rot_model = _pack_features(action_rot_scalars, action_rot_vectors)
+    obs_rot_scalars, obs_rot_vectors, obs_rot_positions, anchor_rot = policy._build_context_tokens(
+        observations_rot, point_cloud_rot
+    )
+    action_rot_gripper, action_rot_orientation, action_rot_positions = policy._split_actions(
+        actions_rot, anchor_rot
+    )
+    action_rot_model = _pack_components(
+        action_rot_gripper,
+        action_rot_orientation,
+        action_rot_positions,
+    )
 
     noise_rot = _rotate_packed(noise, rotation)
     noisy_rot = policy.scheduler.add_noise(action_rot_model, noise_rot, timesteps)
     assert torch.allclose(noisy_rot, _rotate_packed(noisy, rotation), atol=1e-5)
 
-    noisy_rot_scalars, noisy_rot_vectors = _unpack_features(
-        noisy_rot, vector_channels=3, scalar_channels=1
-    )
+    noisy_rot_gripper, noisy_rot_orientation, noisy_rot_positions = _unpack_components(noisy_rot)
     pred_noise_rot = policy._tokenise(
         obs_rot_scalars,
         obs_rot_vectors,
-        noisy_rot_scalars,
-        noisy_rot_vectors,
+        obs_rot_positions,
+        noisy_rot_gripper,
+        noisy_rot_orientation,
+        noisy_rot_positions,
         timesteps,
     )
     assert torch.allclose(pred_noise_rot, _rotate_packed(pred_noise, rotation), atol=2e-4)
@@ -175,18 +227,18 @@ def test_rotate_packed_consistency():
     rotation = group.elements[3].to(dtype=tensor.dtype)
 
     rotated = _rotate_packed(tensor, rotation)
-    scalars, vectors = _unpack_features(rotated, vector_channels=3, scalar_channels=1)
-    original_scalars, original_vectors = _unpack_features(
-        tensor, vector_channels=3, scalar_channels=1
-    )
-    manual_vectors = torch.einsum("ij,...kj->...ki", rotation, original_vectors)
+    grasp, orientation, position = _unpack_components(rotated)
+    grasp_ref, orientation_ref, position_ref = _unpack_components(tensor)
+    manual_orientation = torch.einsum("ij,...kj->...ki", rotation, orientation_ref)
+    manual_position = torch.matmul(position_ref, rotation.t())
 
-    assert torch.allclose(scalars, original_scalars)
-    assert torch.allclose(vectors, manual_vectors)
+    assert torch.allclose(grasp, grasp_ref)
+    assert torch.allclose(orientation, manual_orientation)
+    assert torch.allclose(position, manual_position)
 
 
 def test_tokenise_equivariance_random_actions():
-    observations, _ = _fetch_batch()
+    observations, point_cloud, _ = _fetch_batch()
     group = PLATONIC_GROUPS["icosahedron"]
 
     cfg = PlatonicDiffusionPolicyConfig(
@@ -209,9 +261,9 @@ def test_tokenise_equivariance_random_actions():
     policy = PlatonicDiffusionPolicy(cfg).cpu()
     policy.eval()
 
-    observations = observations
     rotation = group.elements[11].to(dtype=observations.dtype)
     observations_rot = _rotate_pose_sequence(observations, rotation)
+    point_cloud_rot = _rotate_point_cloud(point_cloud, rotation)
 
     rand_pos = torch.randn(observations.shape[0], cfg.horizon, 3)
     rand_quat = _random_quaternion((observations.shape[0], cfg.horizon))
@@ -219,36 +271,60 @@ def test_tokenise_equivariance_random_actions():
     random_actions = torch.cat([rand_pos, rand_quat, rand_grip], dim=-1)
     random_actions_rot = _rotate_pose_sequence(random_actions, rotation)
 
-    obs_scalars, obs_vectors = policy._split_observations(observations)
-    action_scalars, action_vectors = policy._split_actions(random_actions)
-    action_model = _pack_features(action_scalars, action_vectors)
+    obs_scalars, obs_vectors, obs_positions, anchor = policy._build_context_tokens(
+        observations, point_cloud
+    )
+    action_scalars, action_orientation, action_positions = policy._split_actions(
+        random_actions, anchor
+    )
+    action_model = _pack_components(action_scalars, action_orientation, action_positions)
 
-    obs_rot_scalars, obs_rot_vectors = policy._split_observations(observations_rot)
-    action_rot_scalars, action_rot_vectors = policy._split_actions(random_actions_rot)
-    action_rot_model = _pack_features(action_rot_scalars, action_rot_vectors)
+    obs_rot_scalars, obs_rot_vectors, obs_rot_positions, anchor_rot = policy._build_context_tokens(
+        observations_rot, point_cloud_rot
+    )
+    action_rot_scalars, action_rot_orientation, action_rot_positions = policy._split_actions(
+        random_actions_rot, anchor_rot
+    )
+    action_rot_model = _pack_components(
+        action_rot_scalars,
+        action_rot_orientation,
+        action_rot_positions,
+    )
 
     timesteps = torch.randint(0, policy.scheduler.config.num_train_timesteps, (observations.shape[0],))
     noise = torch.randn_like(action_model)
     noisy = policy.scheduler.add_noise(action_model, noise, timesteps)
-    noisy_scalars, noisy_vectors = _unpack_features(noisy, vector_channels=3, scalar_channels=1)
+    noisy_scalars, noisy_orientation, noisy_positions = _unpack_components(noisy)
     pred_noise = policy._tokenise(
-        obs_scalars, obs_vectors, noisy_scalars, noisy_vectors, timesteps
+        obs_scalars,
+        obs_vectors,
+        obs_positions,
+        noisy_scalars,
+        noisy_orientation,
+        noisy_positions,
+        timesteps,
     )
 
-    noisy_rot = policy.scheduler.add_noise(action_rot_model, _rotate_packed(noise, rotation), timesteps)
-    noisy_rot_scalars, noisy_rot_vectors = _unpack_features(noisy_rot, vector_channels=3, scalar_channels=1)
+    noisy_rot = policy.scheduler.add_noise(
+        action_rot_model,
+        _rotate_packed(noise, rotation),
+        timesteps,
+    )
+    noisy_rot_scalars, noisy_rot_orientation, noisy_rot_positions = _unpack_components(noisy_rot)
     pred_noise_rot = policy._tokenise(
         obs_rot_scalars,
         obs_rot_vectors,
+        obs_rot_positions,
         noisy_rot_scalars,
-        noisy_rot_vectors,
+        noisy_rot_orientation,
+        noisy_rot_positions,
         timesteps,
     )
 
     assert torch.allclose(pred_noise_rot, _rotate_packed(pred_noise, rotation), atol=2e-4)
 
 def test_sampling_equivariance_deterministic():
-    observations, _ = _fetch_batch()
+    observations, point_cloud, _ = _fetch_batch()
     group = PLATONIC_GROUPS["icosahedron"]
 
     cfg = PlatonicDiffusionPolicyConfig(
@@ -275,32 +351,37 @@ def test_sampling_equivariance_deterministic():
         (
             observations.shape[0],
             cfg.horizon,
-            cfg.vector_channels * 3 + cfg.scalar_channels,
+            10,
         )
     )
-    scalars, vectors = policy.sample_actions(
+    grip, orientation, position = policy.sample_actions(
         observations,
+        point_cloud,
         initial_noise=noise,
         deterministic=True,
         return_features=True,
     )
-    actions = _features_to_pose(scalars, vectors).cpu()
+    actions = _components_to_pose(grip, orientation, position).cpu()
 
     rotation = group.elements[7].to(dtype=observations.dtype)
     observations_rot = _rotate_pose_sequence(observations, rotation)
+    point_cloud_rot = _rotate_point_cloud(point_cloud, rotation)
 
     noise_rot = _rotate_packed(noise, rotation)
-    scalars_rot, vectors_rot = policy.sample_actions(
+    grip_rot, orientation_rot, position_rot = policy.sample_actions(
         observations_rot,
+        point_cloud_rot,
         initial_noise=noise_rot,
         deterministic=True,
         return_features=True,
     )
-    rot_vectors = torch.einsum("ij,...kj->...ki", rotation, vectors)
-    assert torch.allclose(scalars_rot.cpu(), scalars.cpu(), atol=1e-3)
-    assert torch.allclose(vectors_rot.cpu(), rot_vectors.cpu(), atol=5e-4)
+    rot_orientation = torch.einsum("ij,...kj->...ki", rotation, orientation)
+    rot_position = torch.matmul(position, rotation.t())
+    assert torch.allclose(grip_rot.cpu(), grip.cpu(), atol=1e-3)
+    assert torch.allclose(orientation_rot.cpu(), rot_orientation.cpu(), atol=5e-4)
+    assert torch.allclose(position_rot.cpu(), rot_position.cpu(), atol=5e-4)
 
-    actions_rot = _features_to_pose(scalars_rot, vectors_rot).cpu()
+    actions_rot = _components_to_pose(grip_rot, orientation_rot, position_rot).cpu()
 
     rotated_actions = _rotate_pose_sequence(actions, rotation)
 
@@ -323,7 +404,7 @@ def test_sampling_equivariance_deterministic():
 
 
 def test_sampling_equivariance_rototranslation():
-    observations, _ = _fetch_batch()
+    observations, point_cloud, _ = _fetch_batch()
     group = PLATONIC_GROUPS["icosahedron"]
 
     cfg = PlatonicDiffusionPolicyConfig(
@@ -350,30 +431,33 @@ def test_sampling_equivariance_rototranslation():
         (
             observations.shape[0],
             cfg.horizon,
-            cfg.vector_channels * 3 + cfg.scalar_channels,
+            10,
         )
     )
-    scalars, vectors = policy.sample_actions(
+    grip, orientation, position = policy.sample_actions(
         observations,
+        point_cloud,
         initial_noise=noise,
         deterministic=True,
         return_features=True,
     )
-    actions = _features_to_pose(scalars, vectors).cpu()
+    actions = _components_to_pose(grip, orientation, position).cpu()
 
     rotation = group.elements[9].to(dtype=observations.dtype)
     translation = torch.tensor([0.15, -0.08, 0.05], dtype=observations.dtype)
 
     observations_rt = _rototranslate_pose_sequence(observations, rotation, translation)
+    point_cloud_rt = _rototranslate_point_cloud(point_cloud, rotation, translation)
 
     noise_rt = _rototranslate_packed(noise, rotation, translation)
-    scalars_rt, vectors_rt = policy.sample_actions(
+    grip_rt, orientation_rt, position_rt = policy.sample_actions(
         observations_rt,
+        point_cloud_rt,
         initial_noise=noise_rt,
         deterministic=True,
         return_features=True,
     )
-    actions_rt = _features_to_pose(scalars_rt, vectors_rt).cpu()
+    actions_rt = _components_to_pose(grip_rt, orientation_rt, position_rt).cpu()
 
     reference = _rototranslate_pose_sequence(actions, rotation, translation)
 

@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shuffle", action="store_true", help="Shuffle RLBench samples each epoch.")
     parser.add_argument("--drop-last", action="store_true", help="Drop the final incomplete batch.")
     parser.add_argument("--pin-memory", action="store_true", help="Enable DataLoader pinned-memory optimisation.")
+    parser.add_argument("--pointcloud-max-points", type=int, default=512, help="Optional cap on points per frame; keeps the first N points if provided.",)
     parser.add_argument("--normalization-stats", type=str, default='artifacts/stats/normalization_stats.json', help="Path to dataset normalization stats JSON.")
     
     # Model architecture knobs exposed for quick sweeps.
@@ -88,6 +89,7 @@ def run_validation(
     run,
     epoch: int,
     normalizer: NormalizationTransform | None,
+    max_points: int | None,
 ) -> None:
     if run is None:
         return
@@ -99,12 +101,15 @@ def run_validation(
         proprio = batch["observation"]["proprio_sequence"].to(device)
         pc_points = observation["points"].to(device)
         pc_colors = observation["colors"].to(device)
+        if max_points is not None:
+            pc_points = pc_points[..., :max_points, :]
+            pc_colors = pc_colors[..., :max_points, :]
         gt_actions = batch["action"].to(device)
-        observation_tokens = {
+        point_cloud_tokens = {
             "positions": pc_points,
             "colors": pc_colors,
         }
-        pred_actions = policy.sample_actions(proprio, observation_tokens)
+        pred_actions = policy.sample_actions(proprio, point_cloud_tokens)
     if normalizer:
         cloud_normalized = batch["observation"]["point_cloud_sequence"]
         cloud_denorm = normalizer.denormalize_point_cloud_sequence(cloud_normalized)
@@ -164,8 +169,8 @@ def main() -> None:
 
     # Peek at a reference batch so model dimensions align with cached dataset structure.
     sample = next(iter(dataloader))
-    observations = sample["observation"]["proprio_sequence"]  # (B, To, obs_dim)
-    actions = sample["action"]  # (B, Ta, action_dim)
+    observations = sample["observation"]["proprio_sequence"]  # (B, N_time, N_proprio)
+    actions = sample["action"]  # (B, N_action, N_action_dims)
     context_length = int(observations.shape[1])
     horizon = int(actions.shape[1])
     obs_dim = int(observations.shape[2])
@@ -226,6 +231,7 @@ def main() -> None:
             learned_freqs=not args.platonic_fixed_freqs,
             noise_scheduler_kwargs=scheduler_kwargs,
             num_inference_steps=args.num_inference_steps,
+            scalar_channels=4,
         )
         policy = PlatonicDiffusionPolicy(policy_cfg).to(device)
 
@@ -282,18 +288,25 @@ def main() -> None:
         for batch in progress:
             if normalizer is not None:
                 batch = normalizer.normalize_batch(batch)
-            proprio = batch["observation"]["proprio_sequence"].to(device)  # (B, To, obs_dim)
-            pc_dict = batch["observation"]["point_cloud_sequence"]
-            pc_points = pc_dict["points"].to(device)
-            pc_colors = pc_dict["colors"].to(device)
-            actions = batch["action"].to(device)  # (B, Ta, action_dim)
+
+            # Unpack and transfer mini-batch to the training device.
+            proprio = batch["observation"]["proprio_sequence"].to(device)
+            pc_points = batch["observation"]["point_cloud_sequence"]["points"].to(device)
+            pc_colors = batch["observation"]["point_cloud_sequence"]["colors"].to(device)
+            max_points = args.pointcloud_max_points
+            if max_points is not None:
+                pc_points = pc_points[..., :max_points, :]
+                pc_colors = pc_colors[..., :max_points, :]
+            actions = batch["action"].to(device)    
+
+            # Reconstruct the batch.
             policy_batch = {
-                "proprio": proprio,  # (B, To, obs_dim)
-                "observation": {
-                    "positions": pc_points,  # (B, To, N, 3)
-                    "colors": pc_colors,  # (B, To, N, 3)
+                "proprio": proprio,
+                "point_cloud": {
+                    "positions": pc_points,
+                    "colors": pc_colors,
                 },
-                "actions": actions,  # (B, Ta, action_dim)
+                "actions": actions,
             }
 
             # Standard diffusion training: zero gradients, compute loss, backprop, and step.
@@ -322,7 +335,7 @@ def main() -> None:
             wandb_run.log({"train/epoch_loss": avg_loss, "epoch": epoch})
 
         if args.validate_every > 0 and epoch % args.validate_every == 0:
-            run_validation(policy, dataloader, device, wandb_run, epoch, normalizer)
+            run_validation(policy, dataloader, device, wandb_run, epoch, normalizer, args.pointcloud_max_points)
 
         if epoch % args.checkpoint_every == 0 or epoch == args.epochs:
             checkpoint_dir = output_dir / "checkpoints"

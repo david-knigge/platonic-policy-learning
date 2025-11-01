@@ -30,7 +30,7 @@ from rlbench.datasets.imitation_learning.cached_dataset import (
 
 from src.models.platonic_transformer.groups import PLATONIC_GROUPS
 from src.policies import PlatonicDiffusionPolicy, PlatonicDiffusionPolicyConfig
-from src.policies.platonic_policy import _pack_features, _unpack_features
+from src.policies.platonic_policy import _pack_components, _unpack_components
 from src.utils import NormalizationStats, NormalizationTransform
 from src.utils.geometry import (
     apply_rotation,
@@ -344,6 +344,8 @@ class EquivarianceViewer:
                     f"[viewer] Warning: checkpoint context_length={cfg.context_length} "
                     f"differs from sample context_length={context_length}."
                 )
+            if cfg.scalar_channels < 4:
+                cfg.scalar_channels = 4
             self.horizon = cfg.horizon
             return PlatonicDiffusionPolicy(cfg)
 
@@ -382,6 +384,7 @@ class EquivarianceViewer:
                 "prediction_type": "epsilon",
             },
             num_inference_steps=self.args.num_inference_steps,
+            scalar_channels=4,
         )
         return PlatonicDiffusionPolicy(cfg)
 
@@ -422,20 +425,46 @@ class EquivarianceViewer:
         """Sample a trajectory from the Platonic policy given an observation sequence."""
         if self.policy is None:
             raise RuntimeError("Policy is not initialised.")
+        point_cloud = self._stack_point_cloud(sample.point_cloud_sequence)
         if self.normalizer is not None:
             proprio = self.normalizer.normalize_proprio(proprio)
+            normalized_pc = self.normalizer.normalize_point_cloud_sequence(point_cloud)
+            point_cloud = {
+                "points": normalized_pc["points"],
+                "colors": normalized_pc["colors"],
+            }
+        else:
+            point_cloud = {
+                "points": point_cloud["points"],
+                "colors": point_cloud["colors"],
+            }
+
+        max_points = getattr(self.args, "pointcloud_max_points", None)
+        if max_points is not None:
+            point_cloud = {
+                "points": point_cloud["points"][..., : max_points, :],
+                "colors": point_cloud["colors"][..., : max_points, :],
+            }
+
+        point_cloud = {
+            "positions": point_cloud["points"].unsqueeze(0).to(self.policy.device),
+            "colors": point_cloud["colors"].unsqueeze(0).to(self.policy.device),
+        }
+
         with torch.no_grad():
             # Policy expects shape (B, T_obs, obs_dim); we only use batch size 1.
             batch = proprio.unsqueeze(0).to(self.policy.device)
             if noise is not None:
                 prediction = self.policy.sample_actions(
                     batch,
+                    point_cloud,
                     initial_noise=noise,
                     deterministic=True,
                 )
             else:
                 prediction = self.policy.sample_actions(
                     batch,
+                    point_cloud,
                     generator=self.generator,
                     deterministic=True,
                 )
@@ -462,7 +491,7 @@ class EquivarianceViewer:
                 (
                     1,
                     self.policy.cfg.horizon,
-                    self.policy.cfg.vector_channels * 3 + self.policy.cfg.scalar_channels,
+                    self.policy.packed_action_dim,
                 ),
                 generator=self.generator,
                 device=self.policy.device,
@@ -581,13 +610,14 @@ class EquivarianceViewer:
         )
         if self.policy is not None:
             if self.initial_noise is not None:
-                scalars, vectors = _unpack_features(
-                    self.initial_noise,
-                    vector_channels=self.policy.cfg.vector_channels,
-                    scalar_channels=self.policy.cfg.scalar_channels,
-                )
-                rotated_vectors = torch.einsum("ij,...kj->...ki", rotation, vectors)
-                self.initial_noise = _pack_features(scalars, rotated_vectors).to(
+                grip, orientation, position = _unpack_components(self.initial_noise)
+                rotated_orientation = torch.einsum("ij,...kj->...ki", rotation, orientation)
+                rotated_position = torch.matmul(position, rotation.t())
+                self.initial_noise = _pack_components(
+                    grip,
+                    rotated_orientation,
+                    rotated_position,
+                ).to(
                     device=self.policy.device
                 )
             self.generator = self.generator.manual_seed(0)
@@ -646,3 +676,14 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    def _stack_point_cloud(self, sequence: List[List[dict]]) -> dict[str, torch.Tensor]:
+        points_list: list[torch.Tensor] = []
+        colors_list: list[torch.Tensor] = []
+        for frame_views in sequence:
+            merged_points = torch.cat([view["points"] for view in frame_views], dim=0)
+            merged_colors = torch.cat([view["colors"] for view in frame_views], dim=0)
+            points_list.append(merged_points.to(dtype=torch.float32))
+            colors_list.append(merged_colors.to(dtype=torch.float32))
+        points = torch.stack(points_list, dim=0)
+        colors = torch.stack(colors_list, dim=0)
+        return {"points": points, "colors": colors}
