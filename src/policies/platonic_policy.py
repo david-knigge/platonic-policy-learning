@@ -314,15 +314,6 @@ class PlatonicDiffusionPolicy(nn.Module):
         B, N_time = proprio.shape[:2]
         device = proprio.device
         dtype = proprio.dtype
-        if self.context_time_indices.shape[1] != self.cfg.context_length:
-            raise ValueError(
-                "Context indices length mismatch: "
-                f"expected {self.cfg.context_length}, found {self.context_time_indices.shape[1]}."
-            )
-        if N_time != self.cfg.context_length:
-            raise ValueError(
-                f"Expected proprio context length {self.cfg.context_length}, got {N_time}."
-            )
 
         # Build absolute time embeddings so the transformer can disambiguate history order.
         context_times = self.context_time_indices.to(device=device, dtype=torch.float32)  # [-H+1, 0] indices → (1, N_time)
@@ -342,23 +333,10 @@ class PlatonicDiffusionPolicy(nn.Module):
         )
         proprio_vectors[..., : self.orientation_channels, :] = proprio_orientation  # (B, N_time, 2, 3)
 
-        proprio_positions = proprio_position  # (B, N_time, 3)
-
-        if point_cloud is None:
-            return proprio_scalars, proprio_vectors, proprio_positions, anchor
-
         # Bring point cloud payloads onto the same device/dtype as the model.
         points = point_cloud["positions"].to(device=device, dtype=dtype)
         colors = point_cloud["colors"].to(device=device, dtype=dtype)
-        if points.shape[1] != N_time:
-            raise ValueError(
-                f"Point cloud time dimension mismatch: expected {N_time}, got {points.shape[1]}."
-            )
-        if colors.shape[1] != N_time:
-            raise ValueError(
-                f"Point cloud color time dimension mismatch: expected {N_time}, got {colors.shape[1]}."
-            )
-        _, _, N_points, _ = points.shape
+        B, N_time, N_points, _ = points.shape
 
         # Centre each point around the shared anchor before flattening across time.
         points = points - anchor[:, None, None, :]  # (B, N_time, N_points, 3)
@@ -386,7 +364,7 @@ class PlatonicDiffusionPolicy(nn.Module):
         # Concatenate proprio and point cloud tokens along the sequence axis.
         combined_scalars = torch.cat([proprio_scalars, point_scalars], dim=1)
         combined_vectors = torch.cat([proprio_vectors, point_vectors], dim=1)
-        combined_positions = torch.cat([proprio_positions, point_positions], dim=1)
+        combined_positions = torch.cat([proprio_position, point_positions], dim=1)
 
         return combined_scalars, combined_vectors, combined_positions, anchor
 
@@ -408,31 +386,16 @@ class PlatonicDiffusionPolicy(nn.Module):
             action_vectors: (B, N_action, input_vector_channels, 3) vector token features.
             positions: (B, N_action, 3) passthrough positions for RoPE.
         """
-        if self.action_time_indices.shape[1] != self.cfg.horizon:
-            raise ValueError(
-                "Action indices length mismatch: "
-                f"expected {self.cfg.horizon}, found {self.action_time_indices.shape[1]}."
-            )
+        assert gripper.ndim == 3 and gripper.shape[2] == 1, "Expected gripper shape (B, N_action, 1)."
+        assert orientation.ndim == 4 and orientation.shape[2] == 2 and orientation.shape[3] == 3, "Expected orientation shape (B, N_action, 2, 3)."
+        assert positions.ndim == 3 and positions.shape[2] == 3, "Expected positions shape (B, N_action, 3)."
 
         batch_size, num_tokens = gripper.shape[:2]
-
-        if orientation.shape[:2] != (batch_size, num_tokens):
-            raise ValueError(
-                "Action orientation shape mismatch: "
-                f"expected {(batch_size, num_tokens)}, got {orientation.shape[:2]}."
-            )
-        if positions.shape[:2] != (batch_size, num_tokens):
-            raise ValueError(
-                "Action position shape mismatch: "
-                f"expected {(batch_size, num_tokens)}, got {positions.shape[:2]}."
-            )
 
         # Encode scalar signals and attach the future-looking time embedding.
         action_scalars = self.action_scalar_encoder(gripper)  # (B, N_action, scalar_channels)
         action_times = self.action_time_indices.to(
-            device=action_scalars.device,
-            dtype=torch.float32,
-        )  # (1, N_action)
+            device=action_scalars.device, dtype=torch.float32)  # (1, N_action)
         action_times = action_times.expand(batch_size, -1)  # (B, N_action)
         action_time_emb = self.world_time_embedder(action_times).to(dtype=action_scalars.dtype)  # (B, N_action, scalar_channels)
         action_scalars = action_scalars + action_time_emb  # (B, N_action, scalar_channels)
