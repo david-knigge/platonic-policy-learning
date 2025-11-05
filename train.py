@@ -4,11 +4,12 @@ import argparse
 from dataclasses import asdict
 from pathlib import Path
 import torch
-from torch.utils.data import DataLoader
+
 from tqdm.auto import tqdm
 import wandb
 
 from rlbench.datasets.imitation_learning.cached_dataset import get_temporal_cached_dataloader
+from rlbench.datasets.in_context_imitation_learning.cached_dataset import get_in_context_cached_dataloader
 
 from src.policies import (
     DiTDiffusionPolicy,

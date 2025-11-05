@@ -177,13 +177,18 @@ def test_platonic_policy_equivariance():
     )
     noisy = policy.scheduler.add_noise(action_model, noise, timesteps)  # forward diffusion
     noisy_gripper, noisy_orientation, noisy_positions = _unpack_components(noisy)
+    noisy_action_scalars, noisy_action_vectors, noisy_action_positions = policy._build_action_tokens(
+        noisy_gripper,
+        noisy_orientation,
+        noisy_positions,
+    )
     pred_noise = policy._tokenise(
         obs_scalars,
         obs_vectors,
         obs_positions,
-        noisy_gripper,
-        noisy_orientation,
-        noisy_positions,
+        noisy_action_scalars,
+        noisy_action_vectors,
+        noisy_action_positions,
         timesteps,
     )
 
@@ -209,13 +214,18 @@ def test_platonic_policy_equivariance():
     assert torch.allclose(noisy_rot, _rotate_packed(noisy, rotation), atol=1e-5)
 
     noisy_rot_gripper, noisy_rot_orientation, noisy_rot_positions = _unpack_components(noisy_rot)
+    noisy_rot_action_scalars, noisy_rot_action_vectors, noisy_rot_action_positions = policy._build_action_tokens(
+        noisy_rot_gripper,
+        noisy_rot_orientation,
+        noisy_rot_positions,
+    )
     pred_noise_rot = policy._tokenise(
         obs_rot_scalars,
         obs_rot_vectors,
         obs_rot_positions,
-        noisy_rot_gripper,
-        noisy_rot_orientation,
-        noisy_rot_positions,
+        noisy_rot_action_scalars,
+        noisy_rot_action_vectors,
+        noisy_rot_action_positions,
         timesteps,
     )
     assert torch.allclose(pred_noise_rot, _rotate_packed(pred_noise, rotation), atol=2e-4)
@@ -294,14 +304,19 @@ def test_tokenise_equivariance_random_actions():
     timesteps = torch.randint(0, policy.scheduler.config.num_train_timesteps, (observations.shape[0],))
     noise = torch.randn_like(action_model)
     noisy = policy.scheduler.add_noise(action_model, noise, timesteps)
-    noisy_scalars, noisy_orientation, noisy_positions = _unpack_components(noisy)
+    noisy_gripper, noisy_orientation, noisy_positions = _unpack_components(noisy)
+    noisy_action_scalars, noisy_action_vectors, noisy_action_positions = policy._build_action_tokens(
+        noisy_gripper,
+        noisy_orientation,
+        noisy_positions,
+    )
     pred_noise = policy._tokenise(
         obs_scalars,
         obs_vectors,
         obs_positions,
-        noisy_scalars,
-        noisy_orientation,
-        noisy_positions,
+        noisy_action_scalars,
+        noisy_action_vectors,
+        noisy_action_positions,
         timesteps,
     )
 
@@ -311,13 +326,18 @@ def test_tokenise_equivariance_random_actions():
         timesteps,
     )
     noisy_rot_scalars, noisy_rot_orientation, noisy_rot_positions = _unpack_components(noisy_rot)
+    noisy_rot_action_scalars, noisy_rot_action_vectors, noisy_rot_action_positions = policy._build_action_tokens(
+        noisy_rot_scalars,
+        noisy_rot_orientation,
+        noisy_rot_positions,
+    )
     pred_noise_rot = policy._tokenise(
         obs_rot_scalars,
         obs_rot_vectors,
         obs_rot_positions,
-        noisy_rot_scalars,
-        noisy_rot_orientation,
-        noisy_rot_positions,
+        noisy_rot_action_scalars,
+        noisy_rot_action_vectors,
+        noisy_rot_action_positions,
         timesteps,
     )
 

@@ -130,45 +130,21 @@ class DiTDiffusionPolicy(nn.Module):
         self.num_inference_steps = cfg.num_inference_steps
 
         # Pre-compute absolute time indices for observations and actions.
-        context_idx = torch.arange(cfg.context_length, dtype=torch.float32).unsqueeze(0)  # (1, N_time)
+        # Time indices anchor observations in [-H+1, 0] and actions in [1, horizon].
+        context_idx = torch.arange(
+            -cfg.context_length + 1,
+            1,
+            dtype=torch.float32,
+        ).unsqueeze(0)  # (1, N_time)
         self.register_buffer("context_time_indices", context_idx, persistent=False)
-        action_idx = torch.arange(cfg.horizon, dtype=torch.float32).unsqueeze(0)  # (1, N_action)
+        action_idx = torch.arange(
+            1,
+            cfg.horizon + 1,
+            dtype=torch.float32,
+        ).unsqueeze(0)  # (1, N_action)
         self.register_buffer("action_time_indices", action_idx, persistent=False)
 
     # ------------------------------------------------------------------
-    def _context_time_embedding(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Absolute time indices for the context window."""
-        times = self.context_time_indices.to(device=device, dtype=torch.float32)  # (1, N_time)
-        times = times.expand(batch_size, -1)  # (B, N_time)
-        return self.world_time_embedder(times)  # (B, N_time, hidden_dim)
-
-    def _encode_proprio(self, proprio: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
-        """Embed proprio tokens and tag them with time metadata."""
-        tokens = self.proprio_encoder(proprio)  # (B, N_time, hidden_dim)
-        tokens = tokens + time_emb  # (B, N_time, hidden_dim)
-        return tokens
-
-    def _encode_pointcloud(
-        self,
-        points: torch.Tensor,
-        colors: torch.Tensor,
-        time_emb: torch.Tensor,
-    ) -> torch.Tensor:
-        """Embed every point and flatten across timesteps into transformer tokens.
-
-        Args:
-            points: (B, N_time, N_points, 3) Cartesian coordinates.
-            colors: (B, N_time, N_points, 3) RGB values in [0, 1].
-            time_emb: (B, N_time, hidden_dim) absolute time embeddings.
-
-        Returns:
-            tokens: (B, N_time * N_points, hidden_dim) flattened point tokens.
-        """
-        features = torch.cat([points, colors], dim=-1)  # (B, N_time, N_points, point_feature_dim)
-        per_point = self.point_feature_proj(features)  # (B, N_time, N_points, hidden_dim)
-        tokens = per_point + time_emb.unsqueeze(-2)  # (B, N_time, N_points, hidden_dim)
-        return tokens.reshape(tokens.shape[0], -1, tokens.shape[-1])  # (B, N_time * N_points, hidden_dim)
-
     def _encode_context(
         self,
         proprio: torch.Tensor,
@@ -185,10 +161,28 @@ class DiTDiffusionPolicy(nn.Module):
         Returns:
             context: (B, N_observation_tokens, hidden_dim) observation tokens.
         """
-        batch_size = proprio.shape[0]
-        time_emb = self._context_time_embedding(batch_size, proprio.device)  # (B, N_time, hidden_dim)
-        proprio_tokens = self._encode_proprio(proprio, time_emb)  # (B, N_time, hidden_dim)
-        point_tokens = self._encode_pointcloud(points, colors, time_emb)  # (B, N_time * N_points, hidden_dim)
+        batch_size, num_frames = proprio.shape[:2]
+
+        # Absolute indices span [-H+1, 0] so the model knows where each frame falls in history.
+        frame_indices = self.context_time_indices.to(
+            device=proprio.device,
+            dtype=torch.float32,
+        )  # (1, N_time)
+        frame_indices = frame_indices.expand(batch_size, -1)  # (B, N_time)
+        frame_time_emb = self.world_time_embedder(frame_indices)  # (B, N_time, hidden_dim)
+
+        # Encode proprio signals and inject the frame-wise temporal metadata.
+        proprio_tokens = self.proprio_encoder(proprio)  # (B, N_time, hidden_dim)
+        proprio_tokens = proprio_tokens + frame_time_emb  # (B, N_time, hidden_dim)
+
+        # Combine per-point geometry + RGB, project into hidden width, and tag with time.
+        num_points = points.shape[2]  # number of points per frame
+        point_features = torch.cat([points, colors], dim=-1)  # (B, N_time, N_points, point_feature_dim)
+        point_tokens = self.point_feature_proj(point_features)  # (B, N_time, N_points, hidden_dim)
+        point_tokens = point_tokens + frame_time_emb.unsqueeze(-2)  # broadcast frame metadata → (B, N_time, N_points, hidden_dim)
+        point_tokens = point_tokens.reshape(batch_size, num_frames * num_points, -1)  # (B, N_time*N_points, hidden_dim)
+
+        # Pack proprio followed by flattened point cloud tokens for downstream attention.
         return torch.cat([proprio_tokens, point_tokens], dim=1)  # (B, N_observation_tokens, hidden_dim)
 
     def _encode_actions(self, actions: torch.Tensor) -> torch.Tensor:
@@ -203,7 +197,7 @@ class DiTDiffusionPolicy(nn.Module):
         tokens = self.action_encoder(actions)  # (B, N_action, hidden_dim)
         batch = tokens.shape[0]
         times = self.action_time_indices.to(device=actions.device, dtype=torch.float32)
-        times = times.expand(batch, -1) + float(self.cfg.context_length)  # (B, N_action)
+        times = times.expand(batch, -1)  # (B, N_action)
         time_emb = self.world_time_embedder(times)  # (B, N_action, hidden_dim)
         return tokens + time_emb  # (B, N_action, hidden_dim)
 

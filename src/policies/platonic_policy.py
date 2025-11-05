@@ -16,6 +16,53 @@ from src.utils.geometry import (
 )
 
 
+class SinusoidalTimeEmbedding(nn.Module):
+    """Encode discrete time indices into fixed sinusoidal embeddings.
+
+    Args:
+        dim: Target embedding dimensionality.
+        base: Geometric base controlling sinusoid frequencies.
+    """
+
+    def __init__(self, dim: int, base: float = 10000.0) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError(f"Expected positive embedding dim, got {dim}.")
+
+        # Pre-compute inverse frequencies so we only perform broadcasting at runtime.
+        half_dim = max(1, dim // 2)
+        freq_range = torch.arange(half_dim, dtype=torch.float32)  # (half_dim,)
+        inv_freq = base ** (-freq_range / float(max(1, half_dim)))  # (half_dim,)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.dim = dim
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        """Convert integer time indices to embeddings.
+
+        Args:
+            indices: (B, N) or (B,) tensor of scalar time indices.
+
+        Returns:
+            embeddings: (B, N, dim) sinusoidal encodings.
+        """
+        if indices.ndim == 1:
+            indices = indices.unsqueeze(1)  # (B, 1)
+
+        values = indices.to(self.inv_freq.dtype)  # (B, N)
+        angles = values.unsqueeze(-1) * self.inv_freq  # (B, N, half_dim)
+        sin_cos = torch.cat([angles.sin(), angles.cos()], dim=-1)  # (B, N, 2 * half_dim)
+
+        if sin_cos.shape[-1] < self.dim:
+            pad = torch.zeros(
+                *sin_cos.shape[:-1],
+                self.dim - sin_cos.shape[-1],
+                device=sin_cos.device,
+                dtype=sin_cos.dtype,
+            )  # (B, N, dim - 2*half_dim)
+            sin_cos = torch.cat([sin_cos, pad], dim=-1)  # (B, N, dim)
+        return sin_cos
+
+
 # ---------------------------------------------------------------------------
 def _pose_to_components(
     pose: torch.Tensor,
@@ -146,6 +193,8 @@ class PlatonicDiffusionPolicyConfig:
     output_vector_channels: int = 3
     # Amount of DDIM stochasticity (0 = fully deterministic sampler).
     ddim_eta: float = 0.0
+    # Base frequency for sinusoidal world-time encodings.
+    time_embedding_base: float = 10000.0
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +253,24 @@ class PlatonicDiffusionPolicy(nn.Module):
             nn.Linear(cfg.scalar_channels, cfg.scalar_channels),
         )
 
+        # Pre-compute deterministic time bases so we can tag each token with its world index.
+        self.world_time_embedder = SinusoidalTimeEmbedding(
+            dim=cfg.scalar_channels,
+            base=cfg.time_embedding_base,
+        )
+        context_time = torch.arange(
+            -cfg.context_length + 1,
+            1,
+            dtype=torch.float32,
+        ).unsqueeze(0)  # (1, N_context)
+        self.register_buffer("context_time_indices", context_time, persistent=False)
+        action_time = torch.arange(
+            1,
+            cfg.horizon + 1,
+            dtype=torch.float32,
+        ).unsqueeze(0)  # (1, N_action)
+        self.register_buffer("action_time_indices", action_time, persistent=False)
+
         # Orientation occupies two vector channels; channel 0 remains reserved for positions.
         self.orientation_channels = self.cfg.input_vector_channels
         if self.cfg.output_vector_channels < self.orientation_channels + 1:
@@ -216,76 +283,6 @@ class PlatonicDiffusionPolicy(nn.Module):
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
-
-    def _tokenise(
-        self,
-        obs_scalars: torch.Tensor,
-        obs_vectors: torch.Tensor,
-        obs_positions: torch.Tensor,
-        action_gripper: torch.Tensor,
-        action_orientation: torch.Tensor,
-        action_positions: torch.Tensor,
-        timesteps: torch.Tensor,
-    ) -> torch.Tensor:
-        """Predict the diffusion residual for the action tokens.
-
-        Args:
-            obs_scalars: (B, N_context, scalar_channels) context scalar tokens.
-            obs_vectors: (B, N_context, input_vector_channels, 3) context vector tokens.
-            obs_positions: (B, N_context, 3) relative positions for RoPE.
-            action_gripper: (B, N_action, 1) noisy gripper scalars.
-            action_orientation: (B, N_action, input_vector_channels, 3) noisy orientation axes.
-            action_positions: (B, N_action, 3) noisy relative positions.
-            timesteps: (B,) diffusion step indices.
-
-        Returns:
-            packed_noise: (B, N_action, 10) residual packed via `_pack_components`.
-        """
-        # Embed action scalars so transformer sees rich scalar features.
-        action_scalar_features = self.action_scalar_encoder(action_gripper)  # (B, N_action, scalar_channels)
-
-        # Only orientation is provided through vector features; positions live in the `pos` argument.
-        B, N_action = action_orientation.shape[:2]
-        action_vector_features = torch.zeros(
-            B,
-            N_action,
-            self.cfg.input_vector_channels,
-            3,
-            device=action_orientation.device,
-            dtype=action_orientation.dtype,
-        )  # (B, N_action, C_vec_in, 3)
-        action_vector_features[..., : self.orientation_channels, :] = action_orientation  # fill orientation slots
-
-        # Concatenate context tokens with the (noisy) action tokens.
-        tokens_scalars = torch.cat(
-            [obs_scalars, action_scalar_features],
-            dim=1,
-        )  # (B, N_context + N_action, scalar_channels)
-        tokens_vectors = torch.cat(
-            [obs_vectors, action_vector_features],
-            dim=1,
-        )  # (B, N_context + N_action, C_vec_in, 3)
-        token_positions = torch.cat([obs_positions, action_positions], dim=1)  # (B, N_context + N_action, 3)
-
-        scalar_pred, vector_pred = self.transformer(
-            scalars=tokens_scalars,
-            pos=token_positions,
-            vec=tokens_vectors,
-            time_conditioning=timesteps,
-        )
-
-        # Transformer returns predictions for both context + horizon tokens.
-        pred_scalar_features = scalar_pred[:, -self.cfg.horizon :, :]  # (B, N_action, scalar_channels)
-        pred_vectors = vector_pred[
-            :,
-            -self.cfg.horizon :,
-            :,
-            :,
-        ]  # (B, N_action, output_vector_channels, 3)
-        pred_gripper = self.action_scalar_decoder(pred_scalar_features)  # (B, N_action, 1)
-        pred_orientation = pred_vectors[..., 1:, :]  # (B, N_action, 2, 3)
-        pred_positions = pred_vectors[..., 0, :]  # (B, N_action, 3)
-        return _pack_components(pred_gripper, pred_orientation, pred_positions)
 
     def _build_context_tokens(
         self,
@@ -317,9 +314,24 @@ class PlatonicDiffusionPolicy(nn.Module):
         B, N_time = proprio.shape[:2]
         device = proprio.device
         dtype = proprio.dtype
+        if self.context_time_indices.shape[1] != self.cfg.context_length:
+            raise ValueError(
+                "Context indices length mismatch: "
+                f"expected {self.cfg.context_length}, found {self.context_time_indices.shape[1]}."
+            )
+        if N_time != self.cfg.context_length:
+            raise ValueError(
+                f"Expected proprio context length {self.cfg.context_length}, got {N_time}."
+            )
+
+        # Build absolute time embeddings so the transformer can disambiguate history order.
+        context_times = self.context_time_indices.to(device=device, dtype=torch.float32)  # [-H+1, 0] indices → (1, N_time)
+        context_times = context_times.expand(B, -1)  # (B, N_time)
+        context_time_emb = self.world_time_embedder(context_times).to(dtype=dtype)  # (B, N_time, scalar_channels)
 
         # Embed gripper signals; orientation axes fill the vector stream.
         proprio_scalars = self.proprio_scalar_encoder(proprio_gripper)  # (B, N_time, scalar_channels)
+        proprio_scalars = proprio_scalars + context_time_emb  # tag tokens with absolute time indices
         proprio_vectors = torch.zeros(
             B,
             N_time,
@@ -338,14 +350,29 @@ class PlatonicDiffusionPolicy(nn.Module):
         # Bring point cloud payloads onto the same device/dtype as the model.
         points = point_cloud["positions"].to(device=device, dtype=dtype)
         colors = point_cloud["colors"].to(device=device, dtype=dtype)
+        if points.shape[1] != N_time:
+            raise ValueError(
+                f"Point cloud time dimension mismatch: expected {N_time}, got {points.shape[1]}."
+            )
+        if colors.shape[1] != N_time:
+            raise ValueError(
+                f"Point cloud color time dimension mismatch: expected {N_time}, got {colors.shape[1]}."
+            )
         _, _, N_points, _ = points.shape
 
         # Centre each point around the shared anchor before flattening across time.
         points = points - anchor[:, None, None, :]  # (B, N_time, N_points, 3)
+        point_time_emb = context_time_emb.unsqueeze(-2).expand(
+            B,
+            N_time,
+            N_points,
+            -1,
+        ).reshape(B, N_time * N_points, -1)  # broadcast frame metadata across each point → (B, N_time * N_points, scalar_channels)
 
         point_scalars = self.point_rgb_encoder(
             colors.reshape(B, N_time * N_points, 3)
         )  # (B, N_time * N_points, scalar_channels)
+        point_scalars = point_scalars + point_time_emb  # share time indices across each point set
         point_vectors = torch.zeros(
             B,
             N_time * N_points,
@@ -360,30 +387,146 @@ class PlatonicDiffusionPolicy(nn.Module):
         combined_scalars = torch.cat([proprio_scalars, point_scalars], dim=1)
         combined_vectors = torch.cat([proprio_vectors, point_vectors], dim=1)
         combined_positions = torch.cat([proprio_positions, point_positions], dim=1)
+
         return combined_scalars, combined_vectors, combined_positions, anchor
+
+    def _build_action_tokens(
+        self,
+        gripper: torch.Tensor,
+        orientation: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assemble action token features with time information.
+
+        Args:
+            gripper: (B, N_action, 1) noisy gripper scalars.
+            orientation: (B, N_action, 2, 3) end-effector frame axes.
+            positions: (B, N_action, 3) positions relative to the anchor.
+
+        Returns:
+            action_scalars: (B, N_action, scalar_channels) scalar token features.
+            action_vectors: (B, N_action, input_vector_channels, 3) vector token features.
+            positions: (B, N_action, 3) passthrough positions for RoPE.
+        """
+        if self.action_time_indices.shape[1] != self.cfg.horizon:
+            raise ValueError(
+                "Action indices length mismatch: "
+                f"expected {self.cfg.horizon}, found {self.action_time_indices.shape[1]}."
+            )
+
+        batch_size, num_tokens = gripper.shape[:2]
+
+        if orientation.shape[:2] != (batch_size, num_tokens):
+            raise ValueError(
+                "Action orientation shape mismatch: "
+                f"expected {(batch_size, num_tokens)}, got {orientation.shape[:2]}."
+            )
+        if positions.shape[:2] != (batch_size, num_tokens):
+            raise ValueError(
+                "Action position shape mismatch: "
+                f"expected {(batch_size, num_tokens)}, got {positions.shape[:2]}."
+            )
+
+        # Encode scalar signals and attach the future-looking time embedding.
+        action_scalars = self.action_scalar_encoder(gripper)  # (B, N_action, scalar_channels)
+        action_times = self.action_time_indices.to(
+            device=action_scalars.device,
+            dtype=torch.float32,
+        )  # (1, N_action)
+        action_times = action_times.expand(batch_size, -1)  # (B, N_action)
+        action_time_emb = self.world_time_embedder(action_times).to(dtype=action_scalars.dtype)  # (B, N_action, scalar_channels)
+        action_scalars = action_scalars + action_time_emb  # (B, N_action, scalar_channels)
+
+        # Populate the vector stream with orientation axes; reserve channel 0 for positions.
+        action_vectors = torch.zeros(
+            batch_size,
+            num_tokens,
+            self.cfg.input_vector_channels,
+            3,
+            device=orientation.device,
+            dtype=orientation.dtype,
+        )  # (B, N_action, C_vec_in, 3)
+        action_vectors[..., : self.orientation_channels, :] = orientation  # insert orientation channels
+
+        return action_scalars, action_vectors, positions
 
     def _split_actions(
         self,
         actions: torch.Tensor,
         anchor: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Convert action poses into scalar/vector slots centred at the anchor.
+        """Convert absolute action poses into anchor-centred components.
 
         Args:
-            actions: (B, N_action, 8) pose sequence.
-            anchor: (B, 3) translation offset from the context window.
+            actions: (B, N_action, 8) pose trajectory.
+            anchor: (B, 3) translation offset captured from the context window.
 
         Returns:
             gripper: (B, N_action, 1) gripper openness scalars.
-            orientation: (B, N_action, input_vector_channels, 3) orientation axes.
-            position: (B, N_action, 3) positions relative to the anchor.
+            orientation: (B, N_action, 2, 3) orientation axes.
+            positions: (B, N_action, 3) positions expressed relative to the anchor.
         """
-        gripper, orientation, position = _pose_to_components(actions)  # (B, N_action, 1 / 2 / 3)
-        position = position - anchor[:, None, :]  # (B, N_action, 3)
-        return gripper, orientation, position
+        gripper, orientation, positions = _pose_to_components(actions)  # (B, N_action, 1 / 2 / 3)
+        positions = positions - anchor[:, None, :]  # (B, N_action, 3)
+        return gripper, orientation, positions
 
     # ------------------------------------------------------------------
     # Diffusion interface
+
+    def _predict_diffusion_residual(
+        self,
+        obs_scalars: torch.Tensor,
+        obs_vectors: torch.Tensor,
+        obs_positions: torch.Tensor,
+        action_scalars: torch.Tensor,
+        action_vectors: torch.Tensor,
+        action_positions: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict the diffusion residual for the action tokens.
+
+        Args:
+            obs_scalars: (B, N_context, scalar_channels) context scalar tokens.
+            obs_vectors: (B, N_context, input_vector_channels, 3) context vector tokens.
+            obs_positions: (B, N_context, 3) relative positions for RoPE.
+            action_scalars: (B, N_action, scalar_channels) noisy action scalar tokens.
+            action_vectors: (B, N_action, input_vector_channels, 3) noisy action vector tokens.
+            action_positions: (B, N_action, 3) noisy relative positions.
+            timesteps: (B,) diffusion step indices.
+
+        Returns:
+            packed_noise: (B, N_action, 10) residual packed via `_pack_components`.
+        """
+        # Concatenate context tokens with the (noisy) action tokens.
+        tokens_scalars = torch.cat(
+            [obs_scalars, action_scalars],
+            dim=1,
+        )  # (B, N_context + N_action, scalar_channels)
+        tokens_vectors = torch.cat(
+            [obs_vectors, action_vectors],
+            dim=1,
+        )  # (B, N_context + N_action, C_vec_in, 3)
+        token_positions = torch.cat([obs_positions, action_positions], dim=1)  # (B, N_context + N_action, 3)
+
+        scalar_pred, vector_pred = self.transformer(
+            scalars=tokens_scalars,
+            pos=token_positions,
+            vec=tokens_vectors,
+            time_conditioning=timesteps,
+        )
+
+        # Transformer returns predictions for both context + horizon tokens.
+        pred_scalar_features = scalar_pred[:, -self.cfg.horizon :, :]  # (B, N_action, scalar_channels)
+        pred_vectors = vector_pred[
+            :,
+            -self.cfg.horizon :,
+            :,
+            :,
+        ]  # (B, N_action, output_vector_channels, 3)
+        pred_gripper = self.action_scalar_decoder(pred_scalar_features)  # (B, N_action, 1)
+        pred_orientation = pred_vectors[..., 1:, :]  # (B, N_action, 2, 3)
+        pred_positions = pred_vectors[..., 0, :]  # (B, N_action, 3)
+        return _pack_components(pred_gripper, pred_orientation, pred_positions)
 
     def compute_loss(
         self,
@@ -428,18 +571,21 @@ class PlatonicDiffusionPolicy(nn.Module):
             noise,
             timesteps,
         )  # (B, N_action, 10)
-        noisy_gripper, noisy_orientation, noisy_positions = _unpack_components(
-            noisy_actions,
+        noisy_gripper, noisy_orientation, noisy_positions = _unpack_components(noisy_actions)
+        noisy_action_scalars, noisy_action_vectors, noisy_action_positions = self._build_action_tokens(
+            gripper=noisy_gripper,
+            orientation=noisy_orientation,
+            positions=noisy_positions,
         )
 
         # Predict the Gaussian noise residual under the Platonic transformer.
-        pred_noise = self._tokenise(
+        pred_noise = self._predict_diffusion_residual(
             obs_scalars,
             obs_vectors,
             obs_positions,
-            noisy_gripper,
-            noisy_orientation,
-            noisy_positions,
+            noisy_action_scalars,
+            noisy_action_vectors,
+            noisy_action_positions,
             timesteps,
         )
 
@@ -511,6 +657,11 @@ class PlatonicDiffusionPolicy(nn.Module):
             noisy_gripper, noisy_orientation, noisy_positions = _unpack_components(
                 sample,
             )
+            noisy_action_scalars, noisy_action_vectors, noisy_action_positions = self._build_action_tokens(
+                gripper=noisy_gripper,
+                orientation=noisy_orientation,
+                positions=noisy_positions,
+            )
             timestep_tensor = torch.full(
                 (proprio.shape[0],),
                 timestep,
@@ -518,13 +669,13 @@ class PlatonicDiffusionPolicy(nn.Module):
                 dtype=torch.long,
             )
             # Platonic transformer predicts the denoising residual for horizon tokens.
-            noise_pred = self._tokenise(
+            noise_pred = self._predict_diffusion_residual(
                 obs_scalars,
                 obs_vectors,
                 obs_positions,
-                noisy_gripper,
-                noisy_orientation,
-                noisy_positions,
+                noisy_action_scalars,
+                noisy_action_vectors,
+                noisy_action_positions,
                 timestep_tensor,
             )
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -t 12:00:00
+#SBATCH -t 24:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpu_a100
 #SBATCH --chdir="/home/dknigge/platonic_policy_learning"
@@ -13,4 +13,4 @@ mamba activate ppl
 export PYTHONPATH=/home/dknigge/platonic_policy_learning:$PYTHONPATH
 echo "Running on node: $SLURM_NODELIST"
 
-python train.py --policy=dit
+python train.py --policy=platonic
