@@ -154,7 +154,16 @@ class DiTDiffusionPolicy(nn.Module):
         colors: torch.Tensor,
         time_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Embed every point and flatten across timesteps into transformer tokens."""
+        """Embed every point and flatten across timesteps into transformer tokens.
+
+        Args:
+            points: (B, N_time, N_points, 3) Cartesian coordinates.
+            colors: (B, N_time, N_points, 3) RGB values in [0, 1].
+            time_emb: (B, N_time, hidden_dim) absolute time embeddings.
+
+        Returns:
+            tokens: (B, N_time * N_points, hidden_dim) flattened point tokens.
+        """
         features = torch.cat([points, colors], dim=-1)  # (B, N_time, N_points, point_feature_dim)
         per_point = self.point_feature_proj(features)  # (B, N_time, N_points, hidden_dim)
         tokens = per_point + time_emb.unsqueeze(-2)  # (B, N_time, N_points, hidden_dim)
@@ -166,7 +175,16 @@ class DiTDiffusionPolicy(nn.Module):
         points: torch.Tensor,
         colors: torch.Tensor,
     ) -> torch.Tensor:
-        """Build the observation token block (proprio + point cloud)."""
+        """Build the observation token block (proprio + point cloud).
+
+        Args:
+            proprio: (B, N_time, proprio_dim) proprio sequence.
+            points: (B, N_time, N_points, 3) point cloud positions.
+            colors: (B, N_time, N_points, 3) point colours.
+
+        Returns:
+            context: (B, N_observation_tokens, hidden_dim) observation tokens.
+        """
         batch_size = proprio.shape[0]
         time_emb = self._context_time_embedding(batch_size, proprio.device)  # (B, N_time, hidden_dim)
         proprio_tokens = self._encode_proprio(proprio, time_emb)  # (B, N_time, hidden_dim)
@@ -174,7 +192,14 @@ class DiTDiffusionPolicy(nn.Module):
         return torch.cat([proprio_tokens, point_tokens], dim=1)  # (B, N_observation_tokens, hidden_dim)
 
     def _encode_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        # Embed the (possibly noisy) action tokens using the same hidden dimensionality.
+        """Embed noisy actions into the shared transformer width.
+
+        Args:
+            actions: (B, N_action, action_dim) noisy action samples.
+
+        Returns:
+            tokens: (B, N_action, hidden_dim) time-embedded action tokens.
+        """
         tokens = self.action_encoder(actions)  # (B, N_action, hidden_dim)
         batch = tokens.shape[0]
         times = self.action_time_indices.to(device=actions.device, dtype=torch.float32)
@@ -183,12 +208,28 @@ class DiTDiffusionPolicy(nn.Module):
         return tokens + time_emb  # (B, N_action, hidden_dim)
 
     def _diffusion_condition(self, timesteps: torch.Tensor) -> torch.Tensor:
-        # Encode the diffusion step and project it so AdaLN-Zero can modulate residual streams.
+        """Encode diffusion step indices for AdaLN conditioning.
+
+        Args:
+            timesteps: (B,) integer diffusion step indices.
+
+        Returns:
+            cond: (B, hidden_dim) conditioning embeddings.
+        """
         emb = self.diffusion_time_embedder(timesteps.float().unsqueeze(1))[:, 0, :]  # (B, hidden_dim)
         return self.diffusion_proj(emb)  # (B, hidden_dim)
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
-        # Pull raw observations and actions from the dataloader mini-batch.
+        """Compute the diffusion training loss for a mini-batch.
+
+        Args:
+            batch: Dict with keys `proprio`, `actions`, and either `observation`
+                or legacy `point_cloud`.
+
+        Returns:
+            loss: Scalar MSE between predicted and sampled noise.
+            metrics: Dictionary containing logging scalars.
+        """
         proprio = batch["proprio"]
         observation = batch.get("observation")
         if observation is None:
@@ -245,6 +286,18 @@ class DiTDiffusionPolicy(nn.Module):
         observation: Dict[str, torch.Tensor],
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
+        """Run reverse diffusion to sample an action sequence.
+
+        Args:
+            proprio: (B, N_time, proprio_dim) proprio history.
+            observation: dict containing
+                - positions: (B, N_time, N_points, 3)
+                - colors: (B, N_time, N_points, 3)
+            generator: optional PRNG for deterministic sampling.
+
+        Returns:
+            actions: (B, N_action, action_dim) denoised actions.
+        """
         # Infer batch sizing so the sampler emits a matching action rollout.
         batch_size = proprio.shape[0]  # ()
         device = proprio.device  # torch.device

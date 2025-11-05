@@ -21,6 +21,8 @@ from src.utils import (
     point_cloud_with_actions,
     NormalizationStats,
     NormalizationTransform,
+    WarmupCosineLRSchedulerConfig,
+    build_warmup_cosine_scheduler,
 )
 
 
@@ -33,16 +35,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy", type=str, default="dit", choices=["dit", "platonic"], help="Selects which policy backbone to train.")
 
     # Training loop hyperparameters that control optimisation.
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=32, help="Mini-batch size.")
+    parser.add_argument("--epochs", type=int, default=48, help="Number of training epochs.")
+    parser.add_argument("--batch-size", type=int, default=48, help="Mini-batch size.")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for AdamW.")
     parser.add_argument("--num-workers", type=int, default=4, help="Dataloader worker processes.")
     parser.add_argument("--shuffle", action="store_true", help="Shuffle RLBench samples each epoch.")
     parser.add_argument("--drop-last", action="store_true", help="Drop the final incomplete batch.")
-    parser.add_argument("--pin-memory", action="store_true", help="Enable DataLoader pinned-memory optimisation.")
-    parser.add_argument("--pointcloud-max-points", type=int, default=512, help="Optional cap on points per frame; keeps the first N points if provided.",)
-    parser.add_argument("--normalization-stats", type=str, default='artifacts/stats/normalization_stats.json', help="Path to dataset normalization stats JSON.")
+    parser.add_argument(
+        "--pin-memory",
+        action="store_true",
+        help="Enable DataLoader pinned-memory optimisation.",
+    )
+    parser.add_argument(
+        "--steps-per-epoch",
+        type=int,
+        default=None,
+        help="Override batches per epoch when the dataloader length is undefined.",
+    )
+    parser.add_argument(
+        "--pointcloud-max-points",
+        type=int,
+        default=512,
+        help="Optional cap on points per frame; keeps the first N points if provided.",
+    )
+    parser.add_argument(
+        "--normalization-stats",
+        type=str,
+        default="artifacts/stats/normalization_stats.json",
+        help="Path to dataset normalization stats JSON.",
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        type=str,
+        choices=["none", "warmup_cosine"],
+        default="none",
+        help="Optional learning-rate schedule applied per optimisation step.",
+    )
+    parser.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=0,
+        help="Linear warmup steps before cosine decay engages.",
+    )
+    parser.add_argument(
+        "--lr-min-factor",
+        type=float,
+        default=0.1,
+        help="Final cosine learning rate expressed as a fraction of the base LR.",
+    )
     
     # Model architecture knobs exposed for quick sweeps.
     parser.add_argument("--hidden-dim", type=int, default=512, help="Transformer hidden size.")
@@ -272,6 +313,25 @@ def main() -> None:
     except TypeError:
         batches_per_epoch = None
 
+    steps_per_epoch = batches_per_epoch
+    if steps_per_epoch is None and args.steps_per_epoch is not None:
+        steps_per_epoch = args.steps_per_epoch
+    if args.lr_scheduler != "none" and steps_per_epoch is None:
+        raise ValueError(
+            "LR scheduler requested but steps per epoch is unknown. "
+            "Pass --steps-per-epoch when using iterable-style dataloaders."
+        )
+
+    scheduler = None
+    if args.lr_scheduler == "warmup_cosine":
+        total_steps = int(steps_per_epoch) * args.epochs
+        scheduler_cfg = WarmupCosineLRSchedulerConfig(
+            total_steps=total_steps,
+            warmup_steps=args.lr_warmup_steps,
+            min_lr_ratio=args.lr_min_factor,
+        )
+        scheduler = build_warmup_cosine_scheduler(optimizer, scheduler_cfg)
+
     print("\nStarting training...")
     for epoch in range(1, args.epochs + 1):
         policy.train()
@@ -290,14 +350,14 @@ def main() -> None:
                 batch = normalizer.normalize_batch(batch)
 
             # Unpack and transfer mini-batch to the training device.
-            proprio = batch["observation"]["proprio_sequence"].to(device)
-            pc_points = batch["observation"]["point_cloud_sequence"]["points"].to(device)
-            pc_colors = batch["observation"]["point_cloud_sequence"]["colors"].to(device)
+            proprio = batch["observation"]["proprio_sequence"].to(device)  # (B, N_time, 8)
+            pc_points = batch["observation"]["point_cloud_sequence"]["points"].to(device)  # (B, N_time, N_points, 3)
+            pc_colors = batch["observation"]["point_cloud_sequence"]["colors"].to(device)  # (B, N_time, N_points, 3)
             max_points = args.pointcloud_max_points
             if max_points is not None:
-                pc_points = pc_points[..., :max_points, :]
-                pc_colors = pc_colors[..., :max_points, :]
-            actions = batch["action"].to(device)    
+                pc_points = pc_points[..., :max_points, :]  # (B, N_time, max_points, 3)
+                pc_colors = pc_colors[..., :max_points, :]  # (B, N_time, max_points, 3)
+            actions = batch["action"].to(device)  # (B, N_action, 8)
 
             # Reconstruct the batch.
             policy_batch = {
@@ -307,7 +367,7 @@ def main() -> None:
                     "colors": pc_colors,
                 },
                 "actions": actions,
-            }
+            }  # Matches `PlatonicDiffusionPolicy.compute_loss` contract.
 
             # Standard diffusion training: zero gradients, compute loss, backprop, and step.
             optimizer.zero_grad(set_to_none=True)
@@ -319,6 +379,10 @@ def main() -> None:
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), args.grad_clip)
 
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+                current_lr = scheduler.get_last_lr()[0]
+                wandb_run and wandb_run.log({"train/lr": current_lr}, commit=False)
             batches_processed += 1
             running_loss += loss.item()
             avg_loss = running_loss / batches_processed

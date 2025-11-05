@@ -121,6 +121,7 @@ output_data/
 .vscode/
 wandb
 artifacts
+runs
 
 # # Added these two lines to ignore agents documentation
 .agents_docs
